@@ -1,139 +1,120 @@
-// server.js — pinflow-proxy with hard diagnostics
+// server.js  — Render proxy (ESM)
 import express from "express";
 import cors from "cors";
-import os from "os";
-import fs from "fs/promises";
-import path from "path";
-import crypto from "crypto";
-import { fileURLToPath } from "url";
+import { readFile, writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager } from "@google/generative-ai/server";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import {
+  GoogleAIFileManager
+} from "@google/generative-ai/server";
 
 const PORT = process.env.PORT || 10000;
-const API_KEY = process.env.API_KEY || process.env.GOOGLE_API_KEY;
+const API_KEY = process.env.GEMINI_API_KEY || process.env.API_KEY;
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
-// simple req-id for correlation
-app.use((req, _res, next) => {
-  req.reqId = crypto.randomBytes(6).toString("hex");
-  next();
-});
+// --- helpers -------------------------------------------------
+const ok = (res, data) => res.json(data);
+const bad = (res, code, msg) => res.status(code).json({ error: msg });
 
-function log(req, ...args) {
-  console.log(`[${req.reqId}]`, ...args);
-}
-
-// health + diag
 app.get("/", (_req, res) => res.type("text/plain").send("pinflow-proxy OK"));
-app.get("/health", (_req, res) => res.json({ ok: true, hasKey: Boolean(API_KEY) }));
+app.get("/health", (_req, res) => ok(res, { ok: true, hasKey: !!API_KEY }));
 app.get("/diag", (_req, res) =>
-  res.json({
-    ok: true,
-    node: process.versions.node,
-    env: { hasKey: Boolean(API_KEY) },
-    time: new Date().toISOString(),
-  })
+  ok(res, { ok: true, node: process.version, env: { hasKey: !!API_KEY }, time: new Date().toISOString() })
 );
 
-// util: safe JSON error
-function sendError(req, res, at, err, code = "SERVER_ERROR") {
-  const detail = (err && err.message) ? err.message : String(err);
-  log(req, `[ERR] at=${at} code=${code} detail=${detail}`);
-  // Always return JSON so the client never sees HTML
-  res.status(200).json({ error: code, at, detail, reqId: req.reqId });
+// download Drive file to tmp
+async function downloadToTmp(url, ext = ".mp4") {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`DOWNLOAD_FAILED ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const p = join(tmpdir(), `pinflow_${Date.now()}${ext}`);
+  await writeFile(p, buf);
+  return { path: p, size: buf.length };
 }
 
-// POST /score  { resolved_url, nicheBrief }
+// poll Files API until ACTIVE
+async function waitUntilActive(fileMgr, name, { tries = 30, delayMs = 1000 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    const f = await fileMgr.getFile(name);
+    if (f?.state === "ACTIVE") return f;
+    if (f?.state === "FAILED") throw new Error(`FILE_STATE_FAILED ${name}`);
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  throw new Error(`FILE_NOT_ACTIVE_TIMEOUT ${name}`);
+}
+
+// --- main scoring endpoint ----------------------------------
 app.post("/score", async (req, res) => {
-  const { resolved_url, nicheBrief } = req.body || {};
-  const genAI = new GoogleGenerativeAI(API_KEY);
+  const { resolved_url, niche } = req.body || {};
+  if (!API_KEY) return bad(res, 500, "NO_API_KEY");
+  if (!resolved_url || !niche) return bad(res, 400, "MISSING_FIELDS");
+
+  const gen = new GoogleGenerativeAI(API_KEY);
   const files = new GoogleAIFileManager(API_KEY);
 
-  if (!resolved_url || !nicheBrief) {
-    return sendError(req, res, "input", new Error("Missing resolved_url or nicheBrief"), "BAD_INPUT");
-  }
-  log(req, `[REQ] /score url=${resolved_url}`);
-
-  // 1) Download bytes → temp file
-  const tmp = path.join(os.tmpdir(), `pinflow_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`);
-  let fileName = null;
-  let fileUri = null;
-  let mimeType = "video/mp4";
+  let tmpPath = null;
+  let uploaded = null;
 
   try {
-    log(req, "[STEP] download start");
-    const r = await fetch(resolved_url);
-    if (!r.ok) throw new Error(`download status ${r.status}`);
-    const buf = Buffer.from(await r.arrayBuffer());
-    await fs.writeFile(tmp, buf);
-    log(req, `[STEP] download ok bytes=${buf.length}`);
+    console.log("[REQ] /score url=%s", resolved_url);
 
-    // 2) Upload to Files API (path upload is most reliable)
-    log(req, "[STEP] files.upload (path)");
-    const up = await files.uploadFile(tmp, { mimeType, displayName: path.basename(tmp) });
-    // Google returns { file: { uri, name } } on older SDKs, and sometimes { uri, name } directly on newer.
-    const f = up.file || up;
-    fileUri = f.uri;
-    fileName = f.name; // e.g. "files/abc123"
-    log(req, `[STEP] upload ok uri=${fileUri} name=${fileName}`);
+    // 1) download to tmp
+    const dl = await downloadToTmp(resolved_url, ".mp4");
+    tmpPath = dl.path;
+    console.log("[STEP] download ok bytes=%d", dl.size);
 
-  } catch (err) {
-    await fs.rm(tmp, { force: true }).catch(() => {});
-    return sendError(req, res, "upload", err, "UPLOAD_FAILED");
-  } finally {
-    // cleanup temp immediately after upload
-    await fs.rm(tmp, { force: true }).catch(() => {});
-  }
+    // 2) upload file (path variant)
+    console.log("[STEP] files.upload (path)");
+    uploaded = await files.uploadFile(tmpPath, {
+      mimeType: "video/mp4",
+      displayName: `pinflow_${Date.now()}`
+    });
+    const fileName = uploaded?.file?.name;     // e.g. "files/abc123"
+    const fileUri  = uploaded?.file?.uri;      // https URL
+    if (!fileName || !fileUri) throw new Error("UPLOAD_MISSING_URI");
 
-  // 3) Model call
-  try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
-    const prompt = `Return a single integer 0–10 ONLY (no words): how well this video matches the niche.
-Niche: "${nicheBrief}"`;
+    // 3) WAIT until ACTIVE
+    await waitUntilActive(files, fileName);
+    console.log("[STEP] file ACTIVE name=%s", fileName);
 
-    log(req, "[MODEL] generate start");
-    const result = await model.generateContent({
+    // 4) call model
+    console.log("[MODEL] generate start");
+    const resp = await gen.models.generateContent({
+      model: "gemini-2.5-pro",
       contents: [{
         role: "user",
-        parts: [{ text: prompt }, { fileData: { fileUri, mimeType } }]
+        parts: [
+          { text: `Return a single integer 0–10 for how well this video fits the niche. Niche: "${niche}". Only return the number.` },
+          { fileData: { fileUri, mimeType: "video/mp4" } }
+        ]
       }],
-      generationConfig: { temperature: 0.0 }
+      config: { temperature: 0.0 }
     });
 
-    const text = result?.response?.text?.() ?? result?.text ?? "";
-    log(req, `[MODEL] generate ok text="${String(text).slice(0, 60)}"`);
-
-    const n = Number(String(text).trim());
+    const txt = resp.text().trim();
+    const n = Number(txt);
     if (!Number.isInteger(n) || n < 0 || n > 10) {
-      return sendError(req, res, "parse", new Error(`bad score "${text}"`), "PARSE_FAILED");
+      return ok(res, { score: "PARSE_FAILED" });
     }
-
-    res.json({ score: n, reqId: req.reqId });
+    return ok(res, { score: String(n) });
 
   } catch (err) {
-    return sendError(req, res, "model", err, "GEN_INTERNAL");
+    console.error("[ERR]", err?.message || err);
+    return ok(res, { score: "OTHER_FAILED" });
   } finally {
-    // 4) Best-effort delete on Gemini Files
-    if (fileName) {
-      try {
-        await files.deleteFile(fileName); // must be the short "files/xxx" name
-        log(req, `[STEP] delete ok name=${fileName}`);
-      } catch (e) {
-        log(req, `[WARN] delete failed name=${fileName} detail=${e?.message || e}`);
-      }
-    }
+    // cleanup tmp + cloud file
+    try { if (tmpPath) { await unlink(tmpPath); console.log("[STEP] temp deleted %s", tmpPath); } } catch {}
+    try { if (uploaded?.file?.name) { await files.deleteFile(uploaded.file.name); console.log("[STEP] delete ok name=%s", uploaded.file.name); } } catch {}
   }
 });
 
-// legacy endpoints kept for safety (always JSON)
-app.post("/fetch-and-upload", (_req, res) => res.status(200).json({ error: "DISABLED_USE_SCORE", at: "router" }));
-app.post("/delete-file", (_req, res) => res.status(200).json({ ok: true, note: "handled in /score" }));
+// (optional) old endpoints kept to avoid client 404s
+app.post("/fetch-and-upload", (_req, res) => bad(res, 410, "MOVED_USE_/score"));
+app.post("/delete-file", (_req, res) => ok(res, { ok: true }));
 
 app.listen(PORT, () => {
   console.log(`pinflow-proxy up on :${PORT}`);
