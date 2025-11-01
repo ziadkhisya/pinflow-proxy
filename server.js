@@ -1,17 +1,18 @@
 import express from "express";
 import fetch from "node-fetch";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleAIFileManager } from "@google/generative-ai/server";
 
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
-// === Request log (so Render Logs show every call) ===
+// Request log (so we see every call on Render)
 app.use((req, _res, next) => {
   console.log(`[REQ] ${req.method} ${req.url}`);
   next();
 });
 
-// === CORS (browser → Render) ===
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -20,21 +21,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// === Health ===
+// Health
 app.get("/", (_req, res) => res.send("pinflow-proxy OK"));
 app.get("/health", (_req, res) =>
   res.json({ ok: true, hasKey: !!process.env.GEMINI_API_KEY })
 );
 
-// === Gemini client ===
+// Gemini clients
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.warn("GEMINI_API_KEY not set (calls will fail).");
 const ai = new GoogleGenerativeAI(apiKey);
+// IMPORTANT: File Manager for upload/delete
+const files = new GoogleAIFileManager(apiKey);
 
-// Helper: detect Drive HTML interstitials
 const isHtml = (ctype = "") => ctype.includes("text/html");
 
-// === /fetch-and-upload → { fileUri, mimeType } or detailed error ===
+// POST /fetch-and-upload → { fileUri, fileName, mimeType }
 app.post("/fetch-and-upload", async (req, res) => {
   try {
     const { resolved_url } = req.body || {};
@@ -44,9 +46,8 @@ app.post("/fetch-and-upload", async (req, res) => {
     console.log("[STEP] Download start:", resolved_url);
     const r = await fetch(resolved_url, {
       redirect: "follow",
-      headers: { "User-Agent": "Mozilla/5.0" } // helps with Drive
+      headers: { "User-Agent": "Mozilla/5.0" }
     });
-
     if (!r.ok) {
       console.error("[ERR] DRIVE_FETCH_FAILED status:", r.status);
       return res.status(502).json({ error: "FETCH_FAILED", status: r.status });
@@ -61,48 +62,25 @@ app.post("/fetch-and-upload", async (req, res) => {
 
     const buf = Buffer.from(await r.arrayBuffer());
     console.log("[STEP] Download ok, bytes:", buf.length, "mime:", mimeType);
-
     if (buf.length === 0) return res.status(502).json({ error: "FETCH_FAILED_EMPTY" });
     if (buf.length > 300 * 1024 * 1024) return res.status(413).json({ error: "FILE_TOO_LARGE" });
 
-    // Upload to Gemini Files API (try files.upload, fallback uploadFile)
-    let fileUri = null;
-    try {
-      console.log("[STEP] Gemini upload via files.upload");
-      const up1 = await ai.files.upload({
-        file: { data: buf, mimeType },
-        displayName: `pinflow_${Date.now()}`
-      });
-      fileUri = up1?.file?.uri || null;
-    } catch (e) {
-      console.warn("[WARN] files.upload failed:", e?.message || e);
-      try {
-        console.log("[STEP] Gemini upload via uploadFile (fallback)");
-        const up2 = await ai.uploadFile({
-          file: { data: buf, mimeType },
-          displayName: `pinflow_${Date.now()}`
-        });
-        fileUri = up2?.file?.uri || null;
-      } catch (e2) {
-        const msg = String(e2?.message || e2);
-        console.error("[ERR] uploadFile failed:", msg);
-        if (/invalid api key|unauthorized/i.test(msg)) {
-          return res.status(401).json({ error: "INVALID_API_KEY" });
-        }
-        if (/quota|rate/i.test(msg)) {
-          return res.status(429).json({ error: "QUOTA_EXCEEDED" });
-        }
-        return res.status(502).json({ error: "UPLOAD_FAILED", message: msg });
-      }
-    }
+    // Upload with the File Manager (correct API)
+    console.log("[STEP] Gemini upload via FileManager.uploadFile");
+    const uploaded = await files.uploadFile(buf, {
+      mimeType,
+      displayName: `pinflow_${Date.now()}`
+    });
 
+    const fileUri = uploaded?.file?.uri || null;   // for generateContent
+    const fileName = uploaded?.file?.name || null; // for deletion (files/<id>)
     if (!fileUri) {
-      console.error("[ERR] No fileUri returned from Gemini");
+      console.error("[ERR] No fileUri returned");
       return res.status(502).json({ error: "UPLOAD_FAILED_NO_URI" });
     }
 
-    console.log("[STEP] Upload ok, fileUri:", fileUri);
-    return res.json({ fileUri, mimeType });
+    console.log("[STEP] Upload ok, fileUri:", fileUri, "fileName:", fileName);
+    return res.json({ fileUri, fileName, mimeType });
   } catch (e) {
     const msg = String(e?.message || e);
     console.error("[ERR] SERVER_ERROR:", msg);
@@ -110,32 +88,30 @@ app.post("/fetch-and-upload", async (req, res) => {
   }
 });
 
-// === /delete-file ← { fileUri } ===
+// POST /delete-file ← { fileUri?, fileName? }  (best-effort)
 app.post("/delete-file", async (req, res) => {
   try {
-    const { fileUri } = req.body || {};
-    if (!fileUri) return res.status(400).json({ error: "fileUri required" });
+    const { fileUri, fileName } = req.body || {};
     if (!apiKey) return res.status(500).json({ error: "NO_API_KEY" });
 
+    // Prefer fileName (files/<id>). If only uri is provided, try it directly.
+    const target = fileName || fileUri;
+    if (!target) return res.status(400).json({ error: "fileName or fileUri required" });
+
     try {
-      await ai.files.delete({ fileUri });
-      console.log("[STEP] files.delete ok", fileUri);
+      await files.deleteFile(target);
+      console.log("[STEP] deleteFile ok:", target);
+      return res.json({ ok: true });
     } catch (e) {
-      console.warn("[WARN] files.delete failed, trying deleteFile:", e?.message || e);
-      try {
-        await ai.deleteFile({ fileUri });
-        console.log("[STEP] deleteFile ok", fileUri);
-      } catch (e2) {
-        console.warn("[WARN] deleteFile failed (non-fatal):", e2?.message || e2);
-      }
+      console.warn("[WARN] deleteFile failed (non-fatal):", e?.message || e);
+      return res.json({ ok: false, note: "delete failed (non-fatal)" });
     }
-    return res.json({ ok: true });
   } catch (e) {
     console.warn("[WARN] delete-file handler error (non-fatal):", e?.message || e);
     return res.json({ ok: false, note: "delete failed (non-fatal)" });
   }
 });
 
-// === Start ===
+// Start
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log("pinflow-proxy up on :" + PORT));
