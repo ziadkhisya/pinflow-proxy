@@ -1,12 +1,12 @@
 import express from "express";
 import fetch from "node-fetch";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager } from "@google/generative-ai/server";
+import { GoogleAIFileManager, toFile } from "@google/generative-ai/server";
 
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
-// Request log (so we see every call on Render)
+// Request log
 app.use((req, _res, next) => {
   console.log(`[REQ] ${req.method} ${req.url}`);
   next();
@@ -31,7 +31,6 @@ app.get("/health", (_req, res) =>
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.warn("GEMINI_API_KEY not set (calls will fail).");
 const ai = new GoogleGenerativeAI(apiKey);
-// IMPORTANT: File Manager for upload/delete
 const files = new GoogleAIFileManager(apiKey);
 
 const isHtml = (ctype = "") => ctype.includes("text/html");
@@ -65,15 +64,21 @@ app.post("/fetch-and-upload", async (req, res) => {
     if (buf.length === 0) return res.status(502).json({ error: "FETCH_FAILED_EMPTY" });
     if (buf.length > 300 * 1024 * 1024) return res.status(413).json({ error: "FILE_TOO_LARGE" });
 
-    // Upload with the File Manager (correct API)
+    // ✅ Wrap Buffer into a File-like object before upload
+    const fileLike = await toFile(
+      buf,
+      `pinflow_${Date.now()}.mp4`,
+      { type: mimeType }
+    );
+
     console.log("[STEP] Gemini upload via FileManager.uploadFile");
-    const uploaded = await files.uploadFile(buf, {
+    const uploaded = await files.uploadFile(fileLike, {
       mimeType,
       displayName: `pinflow_${Date.now()}`
     });
 
-    const fileUri = uploaded?.file?.uri || null;   // for generateContent
-    const fileName = uploaded?.file?.name || null; // for deletion (files/<id>)
+    const fileUri  = uploaded?.file?.uri || null;   // for generateContent
+    const fileName = uploaded?.file?.name || null;  // for deletion
     if (!fileUri) {
       console.error("[ERR] No fileUri returned");
       return res.status(502).json({ error: "UPLOAD_FAILED_NO_URI" });
@@ -94,7 +99,6 @@ app.post("/delete-file", async (req, res) => {
     const { fileUri, fileName } = req.body || {};
     if (!apiKey) return res.status(500).json({ error: "NO_API_KEY" });
 
-    // Prefer fileName (files/<id>). If only uri is provided, try it directly.
     const target = fileName || fileUri;
     if (!target) return res.status(400).json({ error: "fileName or fileUri required" });
 
