@@ -2,14 +2,11 @@
   "name": "pinflow-proxy",
   "version": "1.0.0",
   "type": "module",
-  "private": true,
-  "engines": { "node": ">=18" },
-  "scripts": {
-    "start": "node server.js"
-  },
+  "engines": { "node": ">=20 <=25" },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "@google/generative-ai": "0.22.0",
+    "cors": "2.8.5",
+    "express": "4.19.2"
   }
 }
