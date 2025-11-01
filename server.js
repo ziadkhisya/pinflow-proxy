@@ -1,4 +1,4 @@
-// server.js  — full replacement
+// server.js — tolerant key names + explicit logging
 import express from "express";
 import cors from "cors";
 import os from "node:os";
@@ -24,18 +24,20 @@ app.get("/diag", (_req, res) =>
   res.json({ ok: true, node: process.versions.node, env: { hasKey: !!API_KEY }, time: new Date().toISOString() })
 );
 
-/**
- * POST /score
- * body: { resolved_url: string, niche: string }
- * returns: { score: number } or { code, detail }
- */
 app.post("/score", async (req, res) => {
   const id = mkId();
-  const { resolved_url, niche } = req.body || {};
-  console.log(`[${id}] [REQ] /score url=${resolved_url}`);
+
+  // Accept several possible keys so the client can’t break it.
+  const body = req.body || {};
+  const resolved_url = body.resolved_url || body.resolvedUrl || body.url || body.video_url;
+  const niche = body.niche || body.nicheBrief || body.brief;
+
+  console.log(`[${id}] [REQ] /score bodyKeys=${Object.keys(body).join(",")}`);
+  console.log(`[${id}] [REQ] /score url=${resolved_url} nicheLen=${(niche || "").length}`);
 
   if (!API_KEY) return res.status(500).json({ code: "NO_API_KEY" });
-  if (!resolved_url || !niche) return res.status(400).json({ code: "MISSING_FIELDS" });
+  if (!resolved_url || !niche)
+    return res.status(400).json({ code: "MISSING_FIELDS", want: ["resolved_url", "niche"] });
 
   const tmpPath = path.join(os.tmpdir(), `pinflow_${Date.now()}_${id}.mp4`);
   let fileName = null;
@@ -69,7 +71,7 @@ app.post("/score", async (req, res) => {
     console.log(`[${id}] [STEP] file ${state} name=${fileName}`);
     if (state !== "ACTIVE") return res.status(500).json({ code: "FILE_NOT_ACTIVE", detail: state });
 
-    // 4) Score with Gemini
+    // 4) Score
     const ai = new GoogleGenerativeAI(API_KEY);
     const model = ai.getGenerativeModel({ model: "gemini-2.5-pro" });
     const prompt = `Return a single integer 0–10: how well this video matches the niche. Niche: "${niche}". No other text.`;
