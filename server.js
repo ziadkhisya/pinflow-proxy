@@ -1,7 +1,9 @@
 import express from "express";
 import fetch from "node-fetch";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager, toFile } from "@google/generative-ai/server";
+import { GoogleAIFileManager } from "@google/generative-ai/server";
 
 const app = express();
 app.use(express.json({ limit: "100mb" }));
@@ -37,6 +39,7 @@ const isHtml = (ctype = "") => ctype.includes("text/html");
 
 // POST /fetch-and-upload → { fileUri, fileName, mimeType }
 app.post("/fetch-and-upload", async (req, res) => {
+  let tmpPath = null;
   try {
     const { resolved_url } = req.body || {};
     if (!resolved_url) return res.status(400).json({ error: "resolved_url required" });
@@ -64,17 +67,17 @@ app.post("/fetch-and-upload", async (req, res) => {
     if (buf.length === 0) return res.status(502).json({ error: "FETCH_FAILED_EMPTY" });
     if (buf.length > 300 * 1024 * 1024) return res.status(413).json({ error: "FILE_TOO_LARGE" });
 
-    // ✅ Wrap Buffer into a File-like object before upload
-    const fileLike = await toFile(
-      buf,
-      `pinflow_${Date.now()}.mp4`,
-      { type: mimeType }
-    );
+    // ✅ Write to temp file (Render allows /tmp)
+    const base = `pinflow_${Date.now()}.mp4`;
+    tmpPath = path.join("/tmp", base);
+    await fs.writeFile(tmpPath, buf);
+    console.log("[STEP] Wrote temp file:", tmpPath);
 
-    console.log("[STEP] Gemini upload via FileManager.uploadFile");
-    const uploaded = await files.uploadFile(fileLike, {
+    // Upload by file path
+    console.log("[STEP] Gemini upload via FileManager.uploadFile (path)");
+    const uploaded = await files.uploadFile(tmpPath, {
       mimeType,
-      displayName: `pinflow_${Date.now()}`
+      displayName: base
     });
 
     const fileUri  = uploaded?.file?.uri || null;   // for generateContent
@@ -90,6 +93,12 @@ app.post("/fetch-and-upload", async (req, res) => {
     const msg = String(e?.message || e);
     console.error("[ERR] SERVER_ERROR:", msg);
     return res.status(500).json({ error: "SERVER_ERROR", message: msg });
+  } finally {
+    // Clean temp file
+    if (tmpPath) {
+      try { await fs.unlink(tmpPath); console.log("[STEP] Temp deleted:", tmpPath); }
+      catch { /* ignore */ }
+    }
   }
 });
 
