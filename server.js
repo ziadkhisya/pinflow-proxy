@@ -8,13 +8,12 @@ import { GoogleAIFileManager } from "@google/generative-ai/server";
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GEMINI_API_KEY;
-if (!API_KEY) console.warn("[WARN] GEMINI_API_KEY missing");
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// ---- 10 RPM limiter (server-wide) ----
+// ---- 10 RPM limiter ----
 const WINDOW_MS = 60_000;
 const MAX_RPM = 10;
 let starts = [];
@@ -38,16 +37,13 @@ async function downloadToTmp(url) {
   console.log(`[STEP] download start`);
   const r = await fetch(url, { redirect: "follow" });
   if (!r.ok) throw new Error(`DOWNLOAD_FAILED ${r.status}`);
+
   const mime = r.headers.get("content-type") || "application/octet-stream";
+  const buf = Buffer.from(await r.arrayBuffer());   // << fix: Web stream → buffer
   const tmp = path.join(os.tmpdir(), `pinflow_${Date.now()}.bin`);
-  const out = fs.createWriteStream(tmp);
-  await new Promise((res, rej) => {
-    r.body.on("error", rej);
-    out.on("finish", res);
-    r.body.pipe(out);
-  });
-  const bytes = fs.statSync(tmp).size;
-  console.log(`[STEP] download ok bytes=${bytes}`);
+  fs.writeFileSync(tmp, buf);
+
+  console.log(`[STEP] download ok bytes=${buf.length}`);
   return { tmpPath: tmp, mimeType: mime };
 }
 
@@ -142,6 +138,4 @@ app.post("/score", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`pinflow-proxy up on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`pinflow-proxy up on :${PORT}`));
