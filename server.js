@@ -1,10 +1,10 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { GoogleGenerativeAI, GoogleAIFileManager } from "@google/generative-ai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleAIFileManager } from "@google/generative-ai/server";
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GEMINI_API_KEY;
@@ -14,39 +14,37 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// ----- simple 10 RPM limiter (project-wide) -----
+// ---- 10 RPM limiter (server-wide) ----
 const WINDOW_MS = 60_000;
 const MAX_RPM = 10;
 let starts = [];
 async function takeSlot() {
   for (;;) {
     const now = Date.now();
-    starts = starts.filter((t) => now - t < WINDOW_MS);
-    if (starts.length < MAX_RPM) {
-      starts.push(now);
-      return;
-    }
+    starts = starts.filter(t => now - t < WINDOW_MS);
+    if (starts.length < MAX_RPM) { starts.push(now); return; }
     const waitMs = WINDOW_MS - (now - starts[0]) + 5;
-    await new Promise((r) => setTimeout(r, waitMs));
+    await new Promise(r => setTimeout(r, waitMs));
   }
 }
 
-// ----- helpers -----
+// ---- Gemini clients ----
 const fm = new GoogleAIFileManager(API_KEY);
 const gen = new GoogleGenerativeAI(API_KEY);
 const model = gen.getGenerativeModel({ model: "gemini-2.5-flash" });
 
+// ---- helpers ----
 async function downloadToTmp(url) {
   console.log(`[STEP] download start`);
   const r = await fetch(url, { redirect: "follow" });
   if (!r.ok) throw new Error(`DOWNLOAD_FAILED ${r.status}`);
   const mime = r.headers.get("content-type") || "application/octet-stream";
   const tmp = path.join(os.tmpdir(), `pinflow_${Date.now()}.bin`);
-  const file = fs.createWriteStream(tmp);
+  const out = fs.createWriteStream(tmp);
   await new Promise((res, rej) => {
     r.body.on("error", rej);
-    file.on("finish", res);
-    r.body.pipe(file);
+    out.on("finish", res);
+    r.body.pipe(out);
   });
   const bytes = fs.statSync(tmp).size;
   console.log(`[STEP] download ok bytes=${bytes}`);
@@ -57,7 +55,6 @@ async function uploadAndWaitActive(tmpPath, mimeType) {
   console.log(`[STEP] files.upload (path)`);
   const up = await fm.uploadFile(tmpPath, { mimeType });
   const name = up.file.name;
-  // poll ACTIVE
   const deadline = Date.now() + 90_000;
   for (;;) {
     const f = await fm.getFile(name);
@@ -66,7 +63,7 @@ async function uploadAndWaitActive(tmpPath, mimeType) {
       return { fileName: name, fileUri: f.uri, mimeType: f.mimeType || mimeType };
     }
     if (Date.now() > deadline) throw new Error("UPLOAD_NOT_ACTIVE");
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 500));
   }
 }
 
@@ -76,12 +73,12 @@ function parseRetryMs(err) {
   if (m1) return Math.ceil(parseFloat(m1[1]) * 1000);
   const m2 = s.match(/"retryDelay":"(\d+)s"/);
   if (m2) return parseInt(m2[1], 10) * 1000;
-  return 6000; // default ~6s between calls
+  return 6000;
 }
 
-async function scoreWithRetries({ fileUri, mimeType, niche }, maxAttempts = 4) {
+async function scoreWithRetries({ fileUri, mimeType, niche }, attempts = 4) {
   const prompt = `Return a single integer 0–10: how well this video matches the niche. Niche: "${niche}". No text besides the number.`;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (let i = 1; i <= attempts; i++) {
     try {
       console.log(`[MODEL] generate start`);
       const res = await model.generateContent({
@@ -99,8 +96,8 @@ async function scoreWithRetries({ fileUri, mimeType, niche }, maxAttempts = 4) {
       const msg = String(e);
       if (msg.includes("429 Too Many Requests") || msg.includes("quota") || msg.includes("Rate limit")) {
         const wait = parseRetryMs(e);
-        console.log(`[RATE] 429/backoff waitMs=${wait} attempt=${attempt}/${maxAttempts}`);
-        await new Promise((r) => setTimeout(r, wait));
+        console.log(`[RATE] 429/backoff waitMs=${wait} attempt=${i}/${attempts}`);
+        await new Promise(r => setTimeout(r, wait));
         continue;
       }
       console.log(`[ERR] ${msg}`);
@@ -110,7 +107,7 @@ async function scoreWithRetries({ fileUri, mimeType, niche }, maxAttempts = 4) {
   throw new Error("RATE_LIMIT_PERSISTENT");
 }
 
-// ----- endpoints -----
+// ---- endpoints ----
 app.get("/", (_, res) => res.type("text/plain").send("pinflow-proxy OK"));
 app.get("/health", (_, res) => res.json({ ok: true, hasKey: !!API_KEY }));
 app.get("/diag", (_, res) => res.json({ ok: true, node: process.version, env: { hasKey: !!API_KEY }, time: new Date().toISOString() }));
@@ -122,26 +119,18 @@ app.post("/score", async (req, res) => {
     console.log(`[REQ] /score bodyKeys=${bodyKeys}`);
     if (!resolved_url || !niche) return res.status(400).json({ error: "MISSING_FIELDS" });
 
-    // respect 10 RPM
     await takeSlot();
-    console.log(`[REQ] /score url=${resolved_url} nicheLen=${(niche||"").length}`);
+    console.log(`[REQ] /score url=${resolved_url} nicheLen=${(niche || "").length}`);
 
-    // download
     const { tmpPath, mimeType } = await downloadToTmp(resolved_url);
-
-    // upload & wait active
     const { fileName, fileUri } = await uploadAndWaitActive(tmpPath, mimeType);
-
-    // score
     const score = await scoreWithRetries({ fileUri, mimeType, niche });
     console.log(`[DONE] score=${score}`);
 
-    // cleanup
     fs.unlink(tmpPath, () => console.log(`[STEP] temp deleted ${tmpPath}`));
-    await fm.deleteFile(fileName).then(()=> console.log(`[CLEANUP] delete ok name=${fileName}`)).catch(()=>{});
+    await fm.deleteFile(fileName).then(() => console.log(`[CLEANUP] delete ok name=${fileName}`)).catch(() => {});
 
     return res.json({ score });
-
   } catch (e) {
     const msg = String(e);
     console.log(`[ERR] ${msg}`);
