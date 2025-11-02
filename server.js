@@ -1,111 +1,158 @@
-// server.js — tolerant key names + explicit logging
 import express from "express";
 import cors from "cors";
-import os from "node:os";
-import fs from "node:fs/promises";
-import path from "node:path";
-import crypto from "node:crypto";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager } from "@google/generative-ai/server";
+import fetch from "node-fetch";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { GoogleGenerativeAI, GoogleAIFileManager } from "@google/generative-ai";
 
 const PORT = process.env.PORT || 10000;
-const API_KEY = process.env.GEMINI_API_KEY || process.env.API_KEY || "";
+const API_KEY = process.env.GEMINI_API_KEY;
+if (!API_KEY) console.warn("[WARN] GEMINI_API_KEY missing");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const mkId = () => crypto.randomBytes(4).toString("hex");
+// ----- simple 10 RPM limiter (project-wide) -----
+const WINDOW_MS = 60_000;
+const MAX_RPM = 10;
+let starts = [];
+async function takeSlot() {
+  for (;;) {
+    const now = Date.now();
+    starts = starts.filter((t) => now - t < WINDOW_MS);
+    if (starts.length < MAX_RPM) {
+      starts.push(now);
+      return;
+    }
+    const waitMs = WINDOW_MS - (now - starts[0]) + 5;
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+}
 
-app.get("/", (_req, res) => res.type("text").send("pinflow-proxy OK"));
-app.get("/health", (_req, res) => res.json({ ok: true, hasKey: !!API_KEY }));
-app.get("/diag", (_req, res) =>
-  res.json({ ok: true, node: process.versions.node, env: { hasKey: !!API_KEY }, time: new Date().toISOString() })
-);
+// ----- helpers -----
+const fm = new GoogleAIFileManager(API_KEY);
+const gen = new GoogleGenerativeAI(API_KEY);
+const model = gen.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+async function downloadToTmp(url) {
+  console.log(`[STEP] download start`);
+  const r = await fetch(url, { redirect: "follow" });
+  if (!r.ok) throw new Error(`DOWNLOAD_FAILED ${r.status}`);
+  const mime = r.headers.get("content-type") || "application/octet-stream";
+  const tmp = path.join(os.tmpdir(), `pinflow_${Date.now()}.bin`);
+  const file = fs.createWriteStream(tmp);
+  await new Promise((res, rej) => {
+    r.body.on("error", rej);
+    file.on("finish", res);
+    r.body.pipe(file);
+  });
+  const bytes = fs.statSync(tmp).size;
+  console.log(`[STEP] download ok bytes=${bytes}`);
+  return { tmpPath: tmp, mimeType: mime };
+}
+
+async function uploadAndWaitActive(tmpPath, mimeType) {
+  console.log(`[STEP] files.upload (path)`);
+  const up = await fm.uploadFile(tmpPath, { mimeType });
+  const name = up.file.name;
+  // poll ACTIVE
+  const deadline = Date.now() + 90_000;
+  for (;;) {
+    const f = await fm.getFile(name);
+    if (f.state === "ACTIVE") {
+      console.log(`[STEP] file ACTIVE name=${name}`);
+      return { fileName: name, fileUri: f.uri, mimeType: f.mimeType || mimeType };
+    }
+    if (Date.now() > deadline) throw new Error("UPLOAD_NOT_ACTIVE");
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+function parseRetryMs(err) {
+  const s = String(err);
+  const m1 = s.match(/Please retry in (\d+(?:\.\d+)?)s/);
+  if (m1) return Math.ceil(parseFloat(m1[1]) * 1000);
+  const m2 = s.match(/"retryDelay":"(\d+)s"/);
+  if (m2) return parseInt(m2[1], 10) * 1000;
+  return 6000; // default ~6s between calls
+}
+
+async function scoreWithRetries({ fileUri, mimeType, niche }, maxAttempts = 4) {
+  const prompt = `Return a single integer 0–10: how well this video matches the niche. Niche: "${niche}". No text besides the number.`;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`[MODEL] generate start`);
+      const res = await model.generateContent({
+        contents: [{
+          role: "user",
+          parts: [{ text: prompt }, { fileData: { fileUri, mimeType } }]
+        }],
+        generationConfig: { temperature: 0 }
+      });
+      const txt = res.response.text().trim();
+      const n = Number(txt);
+      if (!Number.isInteger(n) || n < 0 || n > 10) throw new Error("PARSE_FAILED");
+      return n;
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("429 Too Many Requests") || msg.includes("quota") || msg.includes("Rate limit")) {
+        const wait = parseRetryMs(e);
+        console.log(`[RATE] 429/backoff waitMs=${wait} attempt=${attempt}/${maxAttempts}`);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      console.log(`[ERR] ${msg}`);
+      throw e;
+    }
+  }
+  throw new Error("RATE_LIMIT_PERSISTENT");
+}
+
+// ----- endpoints -----
+app.get("/", (_, res) => res.type("text/plain").send("pinflow-proxy OK"));
+app.get("/health", (_, res) => res.json({ ok: true, hasKey: !!API_KEY }));
+app.get("/diag", (_, res) => res.json({ ok: true, node: process.version, env: { hasKey: !!API_KEY }, time: new Date().toISOString() }));
 
 app.post("/score", async (req, res) => {
-  const id = mkId();
-
-  // Accept several possible keys so the client can’t break it.
-  const body = req.body || {};
-  const resolved_url = body.resolved_url || body.resolvedUrl || body.url || body.video_url;
-  const niche = body.niche || body.nicheBrief || body.brief;
-
-  console.log(`[${id}] [REQ] /score bodyKeys=${Object.keys(body).join(",")}`);
-  console.log(`[${id}] [REQ] /score url=${resolved_url} nicheLen=${(niche || "").length}`);
-
-  if (!API_KEY) return res.status(500).json({ code: "NO_API_KEY" });
-  if (!resolved_url || !niche)
-    return res.status(400).json({ code: "MISSING_FIELDS", want: ["resolved_url", "niche"] });
-
-  const tmpPath = path.join(os.tmpdir(), `pinflow_${Date.now()}_${id}.mp4`);
-  let fileName = null;
-
   try {
-    // 1) Download
-    console.log(`[${id}] [STEP] download start`);
-    const r = await fetch(resolved_url, { headers: { "user-agent": "Mozilla/5.0" } });
-    if (!r.ok) return res.status(502).json({ code: "DL_FAILED", detail: r.status });
-    const ab = await r.arrayBuffer();
-    const buf = Buffer.from(ab);
-    console.log(`[${id}] [STEP] download ok bytes=${buf.byteLength}`);
-    await fs.writeFile(tmpPath, buf);
+    const { resolved_url, niche } = req.body || {};
+    const bodyKeys = Object.keys(req.body || {}).join(",");
+    console.log(`[REQ] /score bodyKeys=${bodyKeys}`);
+    if (!resolved_url || !niche) return res.status(400).json({ error: "MISSING_FIELDS" });
 
-    // 2) Upload to Files API
-    const fm = new GoogleAIFileManager(API_KEY);
-    console.log(`[${id}] [STEP] files.upload (path)`);
-    const up = await fm.uploadFile(tmpPath, { mimeType: "video/mp4", displayName: path.basename(tmpPath) });
-    const uri = up?.file?.uri;
-    fileName = up?.file?.name;
-    if (!uri || !fileName) return res.status(500).json({ code: "UPLOAD_FAILED" });
+    // respect 10 RPM
+    await takeSlot();
+    console.log(`[REQ] /score url=${resolved_url} nicheLen=${(niche||"").length}`);
 
-    // 3) Wait for ACTIVE
-    let state = "PENDING";
-    for (let i = 0; i < 30; i++) {
-      const f = await fm.getFile(fileName);
-      state = f?.state || "UNKNOWN";
-      if (state === "ACTIVE") break;
-      await sleep(1000);
-    }
-    console.log(`[${id}] [STEP] file ${state} name=${fileName}`);
-    if (state !== "ACTIVE") return res.status(500).json({ code: "FILE_NOT_ACTIVE", detail: state });
+    // download
+    const { tmpPath, mimeType } = await downloadToTmp(resolved_url);
 
-    // 4) Score
-    const ai = new GoogleGenerativeAI(API_KEY);
-    const model = ai.getGenerativeModel({ model: "gemini-2.5-pro" });
-    const prompt = `Return a single integer 0–10: how well this video matches the niche. Niche: "${niche}". No other text.`;
+    // upload & wait active
+    const { fileName, fileUri } = await uploadAndWaitActive(tmpPath, mimeType);
 
-    console.log(`[${id}] [MODEL] generate start`);
-    const result = await model.generateContent([
-      { text: prompt },
-      { fileData: { fileUri: uri, mimeType: "video/mp4" } },
-    ]);
-    const text = (await result.response.text()).trim();
-    const n = Number(text);
+    // score
+    const score = await scoreWithRetries({ fileUri, mimeType, niche });
+    console.log(`[DONE] score=${score}`);
 
-    if (!Number.isInteger(n) || n < 0 || n > 10) {
-      console.log(`[${id}] [ERR] PARSE_FAILED raw="${text}"`);
-      return res.status(422).json({ code: "PARSE_FAILED", detail: text });
-    }
+    // cleanup
+    fs.unlink(tmpPath, () => console.log(`[STEP] temp deleted ${tmpPath}`));
+    await fm.deleteFile(fileName).then(()=> console.log(`[CLEANUP] delete ok name=${fileName}`)).catch(()=>{});
 
-    console.log(`[${id}] [DONE] score=${n}`);
-    return res.json({ score: n });
-  } catch (err) {
-    console.log(`[${id}] [ERR]`, err?.message || String(err));
-    return res.status(500).json({ code: "GEN_INTERNAL", detail: String(err?.message || err) });
-  } finally {
-    try { await fs.rm(tmpPath, { force: true }); } catch {}
-    if (fileName) {
-      try {
-        const fm = new GoogleAIFileManager(API_KEY);
-        await fm.deleteFile(fileName);
-        console.log(`[${id}] [CLEANUP] delete ok name=${fileName}`);
-      } catch (e) {
-        console.log(`[${id}] [CLEANUP] delete failed name=${fileName} ${e?.message || e}`);
-      }
-    }
+    return res.json({ score });
+
+  } catch (e) {
+    const msg = String(e);
+    console.log(`[ERR] ${msg}`);
+    if (msg.includes("MISSING_FIELDS")) return res.status(400).json({ error: "MISSING_FIELDS" });
+    if (msg.includes("DOWNLOAD_FAILED")) return res.status(400).json({ error: "DOWNLOAD_FAILED" });
+    if (msg.includes("PARSE_FAILED")) return res.status(500).json({ error: "PARSE_FAILED" });
+    if (msg.includes("RATE_LIMIT_PERSISTENT")) return res.status(429).json({ error: "RATE_LIMIT_PERSISTENT" });
+    return res.status(500).json({ error: "GEN_INTERNAL" });
   }
 });
 
-app.listen(PORT, () => console.log(`pinflow-proxy up on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`pinflow-proxy up on :${PORT}`);
+});
