@@ -1,150 +1,154 @@
-// server.js (PinFlow proxy) – 2025-11-03
-// ESM-only. Node >= 20.10. Uses native fetch and @google/generative-ai.
+// server.js
+import express from "express";
+import morgan from "morgan";
+import fs from "fs/promises";
+import path from "path";
+import os from "os";
 
-import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
-import { createWriteStream } from "node:fs";
-import { promises as fs } from "node:fs";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-
+// Google GenAI SDK
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleAIFileManager } from "@google/generative-ai/server";
 
-const PORT  = Number(process.env.PORT || 10000);
-const MODEL = process.env.MODEL || "gemini-2.5-flash";
-const API_KEY = (process.env.API_KEY || process.env.GEMINI_API_KEY || "").trim();
+// ---------- config ----------
+const PORT = process.env.PORT || 10000;
+const MODEL = process.env.GEN_MODEL || "gemini-2.5-flash";
 
-function jres(res, code, data) {
-  res.writeHead(code, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(data));
+// accept either env name
+const API_KEY =
+  process.env.API_KEY ||
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY;
+
+if (!API_KEY) {
+  console.error("[BOOT] No API key in env (API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY).");
 }
 
-function bad(res, code, msg) {
-  jres(res, code, { error: msg });
-}
+const app = express();
+app.use(express.json({ limit: "30mb" }));
+app.use(morgan("dev"));
 
-function getBody(req) {
-  return new Promise((resolve, reject) => {
-    let s = "";
-    req.setEncoding("utf8");
-    req.on("data", (c) => (s += c));
-    req.on("end", () => {
-      try { resolve(s ? JSON.parse(s) : {}); }
-      catch (e) { reject(e); }
-    });
-    req.on("error", reject);
-  });
-}
+// CORS: wide open for AI Studio
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Friendly root so you see a banner instead of "Cannot GET /"
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "pinflow-proxy", model: MODEL });
+});
+
+app.get("/selftest", (_req, res) => res.json({ ok: true, text: "Ping!" }));
+app.get("/health", (_req, res) => res.json({ ok: true, hasKey: !!API_KEY }));
+app.get("/diag", (_req, res) => res.json({ ok: true, keyLen: API_KEY?.length || 0, model: MODEL }));
+
+// ---------- helpers ----------
+const gen = new GoogleGenerativeAI(API_KEY);
+const files = new GoogleAIFileManager(API_KEY);
 
 async function downloadToTemp(url) {
-  console.log("[STEP] download start %s", url);
-  const r = await fetch(url, { redirect: "follow" });
-  if (!r.ok) throw new Error(`download_non_200 ${r.status}`);
-  const mime = r.headers.get("content-type") || "video/mp4";
-  const p = pathJoin(tmpdir(), `pinflow_${Date.now()}.mp4`);
-  const ws = createWriteStream(p);
-  // Convert WHATWG stream to Node stream
-  const rs = Readable.fromWeb(r.body);
-  await pipeline(rs, ws);
-  const stat = await fs.stat(p);
-  console.log("[STEP] download ok bytes=%d mime=%s", stat.size, mime);
-  return { path: p, mime };
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download failed ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const filePath = path.join(os.tmpdir(), `pinflow_${Date.now()}.mp4`);
+  await fs.writeFile(filePath, buf);
+  return { filePath, bytes: buf.length, mime: r.headers.get("content-type") || "video/mp4" };
 }
 
-// Wait until uploaded file becomes ACTIVE
-async function waitForActive(fm, name, { pollMs = 900, maxMs = 60000 } = {}) {
-  const t0 = Date.now();
-  while (true) {
-    const f = await fm.getFile(name);
-    if (f.state === "ACTIVE") return f;
-    if (f.state === "FAILED") throw new Error(`file_failed ${f.stateMessage || "unknown"}`);
-    if (Date.now() - t0 > maxMs) throw new Error(`file_not_active_timeout state=${f.state}`);
-    await new Promise((r) => setTimeout(r, pollMs));
+async function uploadAndWaitActive(localPath, mime) {
+  const uploaded = await files.uploadFile(localPath, {
+    mimeType: mime,
+    displayName: path.basename(localPath),
+  });
+
+  // poll file status until ACTIVE or timeout
+  const id = uploaded.file.name; // e.g. files/abcd123
+  const start = Date.now();
+  while (Date.now() - start < 30000) {
+    const info = await files.getFile(id);
+    if (info.state === "ACTIVE") return info;
+    await new Promise(r => setTimeout(r, 1000));
   }
+  throw new Error(`file ${id} not ACTIVE after 30s`);
 }
 
-const server = createServer(async (req, res) => {
+// ---------- main route ----------
+app.post("/score", async (req, res) => {
+  // accept both naming styles
+  const resolvedUrl = req.body.resolved_url || req.body.resolvedUrl || req.body.url;
+  const nicheBrief = req.body.niche || req.body.nicheBrief || "";
+
+  if (!resolvedUrl) return res.status(400).json({ error: "MISSING_FIELDS", need: ["resolved_url", "niche"] });
+
+  console.log("[REQ] /score url=%s nicheLen=%s", resolvedUrl, String(nicheBrief?.length ?? 0));
+
+  let tempPath;
   try {
-    // Simple routing
-    if (req.method === "GET" && req.url === "/selftest") {
-      return jres(res, 200, { ok: true, text: "Ping" });
-    }
-    if (req.method === "GET" && req.url === "/health") {
-      return jres(res, 200, { ok: true, hasKey: Boolean(API_KEY), model: MODEL });
-    }
-    if (req.method === "GET" && req.url === "/diag") {
-      return jres(res, 200, { ok: true, keyLen: API_KEY.length, model: MODEL });
-    }
+    // 1) download
+    const d = await downloadToTemp(resolvedUrl);
+    tempPath = d.filePath;
+    console.log("[STEP] download ok bytes=%d mime=%s", d.bytes, d.mime);
 
-    if (req.method === "POST" && req.url === "/score") {
-      if (!API_KEY) return bad(res, 401, "API_KEY_INVALID");
+    // 2) upload & wait ACTIVE
+    console.log("[STEP] files.upload");
+    const fileInfo = await uploadAndWaitActive(tempPath, d.mime);
+    const file = { fileUri: fileInfo.uri, mimeType: d.mime };
 
-      // Accept both naming styles from the app
-      const body = await getBody(req);
-      const resolvedUrl = body.resolved_url || body.resolvedUrl || body.url;
-      const nicheBrief = body.nicheBrief || body.niche || "";
+    // 3) ask model
+    const prompt = [
+      {
+        role: "user",
+        parts: [
+          { text: "You are scoring short-form videos for niche fit on a 0–10 scale." },
+          { text: "Niche brief:\n" + nicheBrief },
+          file,
+          {
+            text:
+              "Return JSON with fields: score (0-10 integer), reason (<=2 sentences), confidence (0-100 integer). " +
+              "Only return JSON.",
+          },
+        ],
+      },
+    ];
 
-      console.log("[REQ] /score bodyKeys=%s", Object.keys(body).join(","));
-      if (!resolvedUrl) return bad(res, 400, "MISSING_FIELDS");
+    const model = gen.getGenerativeModel({ model: MODEL });
+    const out = await model.generateContent({ contents: prompt });
+    const text = out.response.text().trim();
 
-      // Download
-      const { path: tmpPath, mime } = await downloadToTemp(resolvedUrl);
-
-      // Upload -> wait ACTIVE
-      const fm = new GoogleAIFileManager(API_KEY);
-      console.log("[STEP] files.upload (path)");
-      const up = await fm.uploadFile(tmpPath, {
-        mimeType: mime,
-        displayName: `pinflow_${Date.now()}.mp4`,
-      });
-      console.log("[STEP] files.upload name=%s state=%s", up.file.name, up.file.state);
-
-      const active = await waitForActive(fm, up.file.name);
-      console.log("[STEP] file ACTIVE uri=%s", active.uri);
-
-      // Generate
-      const genAI = new GoogleGenerativeAI(API_KEY);
-      const model = genAI.getGenerativeModel({ model: MODEL });
-
-      const prompt =
-        `You are scoring TikTok/short videos for niche fit.\n` +
-        `Niche brief: """${nicheBrief}"""\n` +
-        `Return ONLY this compact line (no JSON):\n` +
-        `score=<0-10>; reason=<<=160 chars plain sentence>; confidence=<low|med|high>`;
-
-      const resp = await model.generateContent({
-        contents: [{
-          role: "user",
-          parts: [
-            { fileData: { fileUri: active.uri, mimeType: mime } },
-            { text: prompt }
-          ]
-        }],
-        generationConfig: { temperature: 0.2 },
-      });
-
-      const text = resp.response.text();
-      console.log("[STEP] model ok len=%d", (text || "").length);
-
-      // Cleanup the temp file, ignore errors
-      try { await fs.unlink(tmpPath); console.log("[CLEANUP] temp deleted %s", tmpPath); } catch {}
-
-      // Contract: return plain data the Studio app can parse
-      return jres(res, 200, { ok: true, text });
+    // try to parse; fall back to text
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { score: null, reason: text, confidence: null };
     }
 
-    // Fallback
-    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-    res.end("Cannot GET " + req.url);
+    return res.json({
+      ok: true,
+      model: MODEL,
+      result: parsed,
+    });
   } catch (err) {
-    console.error("[ERR]", err);
-    return bad(res, 500, "GEN_INTERNAL");
+    console.error("[ERR]", err?.stack || String(err));
+    return res.status(500).json({ error: "GEN_INTERNAL" });
+  } finally {
+    if (tempPath) {
+      try {
+        await fs.unlink(tempPath);
+        console.log("[CLEANUP] temp deleted %s", tempPath);
+      } catch {}
+    }
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`[BOOT] node=${process.version}`);
-  console.log("pinflow-proxy up on :" + PORT);
+// ---------- start ----------
+app.listen(PORT, () => {
+  console.log("[BOOT] node=%s", process.version);
+  console.log("pinflow-proxy up on :%s", PORT);
 });
