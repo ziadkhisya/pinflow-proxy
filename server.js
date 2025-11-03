@@ -1,138 +1,168 @@
-// server.js — pinflow-proxy
+// server.js
 import express from "express";
-import cors from "cors";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs/promises";
+import fs from "fs/promises";
+import path from "path";
+import os from "os";
+import crypto from "crypto";
+import { fileURLToPath } from "url";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleAIFileManager } from "@google/generative-ai/server";
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+const APP = express();
+APP.use(express.json({ limit: "2mb" }));
+
+// ---- CONFIG & DIAGNOSTICS ---------------------------------------------------
+const API_KEY = (process.env.API_KEY || process.env.GEMINI_API_KEY || "").trim();
+const MODEL_ID = process.env.GEMINI_MODEL || "gemini-2.5-flash"; // free-tier friendly
 const PORT = process.env.PORT || 10000;
-// Accept both names so we never get bitten by this again:
-const API_KEY =
-  process.env.GEMINI_API_KEY ||
-  process.env.API_KEY ||
-  process.env.GOOGLE_API_KEY ||
-  "";
 
-console.log(
-  `[BOOT] node=${process.version} keySource=${
-    process.env.GEMINI_API_KEY ? "GEMINI_API_KEY"
-    : process.env.API_KEY ? "API_KEY"
-    : process.env.GOOGLE_API_KEY ? "GOOGLE_API_KEY"
-    : "none"
-  }`
-);
+const hasKey = () => API_KEY.length > 0;
 
-const genAI = API_KEY ? new GoogleGenerativeAI(API_KEY) : null;
-const files = API_KEY ? new GoogleAIFileManager({ apiKey: API_KEY }) : null;
+const genClient = () => new GoogleGenerativeAI(API_KEY);
+const fileMgr   = () => new GoogleAIFileManager({ apiKey: API_KEY });
 
-app.get("/health", (req, res) => res.json({ ok: true, hasKey: !!API_KEY }));
-app.get("/diag", (req, res) =>
-  res.json({ ok: true, node: process.version, hasKey: !!API_KEY, time: new Date().toISOString() })
-);
-app.get("/selftest", async (req, res) => {
-  try {
-    if (!API_KEY) return res.status(400).json({ ok: false, error: "NO_API_KEY" });
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const r = await model.generateContent("pong");
-    return res.json({ ok: true, text: r.response.text() });
-  } catch (e) {
-    console.error("[SELFTEST ERR]", e);
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
-});
+const log = (...a) => console.log(...a);
 
-async function downloadToTmp(url) {
-  console.log("[STEP] download start", url);
+// simple helpers
+const tmpPath = (ext=".mp4") =>
+  path.join(os.tmpdir(), `pinflow_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`);
+
+async function downloadToFile(url) {
   const r = await fetch(url, { redirect: "follow" });
-  if (!r.ok) throw new Error(`download_failed_${r.status}`);
+  if (!r.ok) throw new Error(`proxy_non_200 ${r.status}`);
+  const mime = r.headers.get("content-type") || "application/octet-stream";
   const buf = Buffer.from(await r.arrayBuffer());
-  const tmp = path.join(os.tmpdir(), `pinflow_${Date.now()}.mp4`);
-  await fs.writeFile(tmp, buf);
-  const mime = r.headers.get("content-type") || "video/mp4";
-  console.log("[STEP] download ok bytes=%d mime=%s", buf.length, mime);
-  return { tmp, mime };
+  const out = tmpPath("." + (mime.split("/")[1] || "bin"));
+  await fs.writeFile(out, buf);
+  return { path: out, bytes: buf.length, mime };
 }
 
-async function waitActive(name, tries = 30) {
-  for (let i = 0; i < tries; i++) {
-    const f = await files.getFile(name);
-    if (f.state === "ACTIVE") return f;
-    await new Promise(r => setTimeout(r, 1000));
+async function waitActive(fm, name, timeoutMs = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const f = await fm.getFile(name);
+    if (f?.state === "ACTIVE") return f;
+    await new Promise(r => setTimeout(r, 500));
   }
-  throw new Error("upload_not_active");
+  throw new Error("file_not_active_timeout");
 }
 
-app.post("/score", async (req, res) => {
-  const url = req.body?.resolved_url || req.body?.resolvedUrl || req.body?.url || "";
-  const niche = req.body?.niche || req.body?.nicheBrief || req.body?.brief || "";
+function normalizeBody(body) {
+  // accept both legacy and new field names
+  const url = body.resolved_url || body.resolvedUrl || body.url;
+  const niche = body.niche || body.nicheBrief || body.brief || "";
+  return { url, niche };
+}
 
-  console.log("[REQ] /score bodyKeys=%s", Object.keys(req.body || {}).join(","));
-  console.log("[REQ] /score url=%s nicheLen=%s", url, niche?.length || 0);
+// ---- ROUTES -----------------------------------------------------------------
+APP.get("/health", (_req, res) => {
+  res.json({ ok: true, hasKey: hasKey(), model: MODEL_ID });
+});
 
-  if (!url) return res.status(400).json({ error: "MISSING_FIELDS" });
-  if (!API_KEY) return res.status(500).json({ error: "NO_API_KEY" });
+APP.get("/selftest", (_req, res) => {
+  res.json({ ok: true, text: "Ping!" });
+});
 
-  let tmpPath = null, uploadedName = null;
-
+// quick key sanity check (text-only call, no uploads)
+APP.get("/diag", async (_req, res) => {
   try {
-    const dl = await downloadToTmp(url);
-    tmpPath = dl.tmp;
-
-    console.log("[STEP] files.upload (path)");
-    const up = await files.uploadFile(tmpPath, {
-      mimeType: dl.mime,
-      displayName: path.basename(tmpPath),
-    });
-    uploadedName = up.file.name; // e.g. files/abc123
-    console.log("[STEP] upload ok name=%s uri=%s", uploadedName, up.file.uri);
-
-    await waitActive(uploadedName);
-    console.log("[STEP] file ACTIVE name=%s", uploadedName);
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const prompt =
-      `You score how well a video matches this niche: "${niche}".\n` +
-      `Return ONLY JSON: {"score":0..10,"reason":"<=160 chars","confidence":0..100}\n` +
-      `No prose, no extra keys.`;
-
-    console.log("[MODEL] generate start");
-    const out = await model.generateContent([
-      { fileData: { fileUri: up.file.uri, mimeType: dl.mime } },
-      { text: prompt },
-    ]);
-
-    const text = out.response.text().trim();
-    let parsed;
-    try { parsed = JSON.parse(text); }
-    catch {
-      return res.status(200).json({ score: 0, reason: "BAD_JSON", confidence: null, raw: text });
-    }
-
-    const score = Math.max(0, Math.min(10, parseInt(parsed.score ?? 0, 10)));
-    const reason = (parsed.reason || "").slice(0, 200);
-    const confidence = parsed.confidence == null ? null :
-      Math.max(0, Math.min(100, parseInt(parsed.confidence, 10)));
-
-    console.log("[DONE] score=%s", score);
-    return res.json({ score, reason, confidence });
+    if (!hasKey()) return res.status(400).json({ ok: false, error: "NO_KEY" });
+    const model = genClient().getGenerativeModel({ model: MODEL_ID });
+    await model.countTokens({ contents: [{ role: "user", parts: [{ text: "ping" }]}] });
+    res.json({ ok: true, keyLen: API_KEY.length, model: MODEL_ID });
   } catch (e) {
-    const msg = String(e?.message || e);
-    const is429 = /Too Many Requests|quota|Rate|retry/i.test(msg) || e?.status === 429;
-    const isKey = /API key not valid|API_KEY_INVALID/i.test(msg);
-    console.error("[ERR]", e);
-    return res
-      .status(isKey ? 401 : is429 ? 429 : 500)
-      .json({ error: isKey ? "API_KEY_INVALID" : is429 ? "RATE_LIMIT" : "GEN_INTERNAL", detail: msg });
-  } finally {
-    if (uploadedName) { try { await files.deleteFile(uploadedName); console.log("[CLEANUP] delete ok name=%s", uploadedName); } catch {} }
-    if (tmpPath) { try { await fs.unlink(tmpPath); console.log("[CLEANUP] temp deleted %s", tmpPath); } catch {} }
+    res.status(500).json({ ok: false, error: "GEN_INTERNAL", detail: String(e) });
   }
 });
 
-app.listen(PORT, () => console.log(`pinflow-proxy up on :${PORT}`));
+// main scoring endpoint
+APP.post("/score", async (req, res) => {
+  const { url, niche } = normalizeBody(req.body || {});
+  log("[REQ] /score bodyKeys=%s url=%s nicheLen=%s",
+      Object.keys(req.body || {}).join(","), url, (niche || "").length);
+
+  if (!hasKey()) return res.status(401).json({ error: "API_KEY_INVALID" });
+  if (!url)      return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  let tempFile = null;
+  let uploadedName = null;
+
+  try {
+    // 1) Download
+    log("[STEP] download start %s", url);
+    const dl = await downloadToFile(url);
+    tempFile = dl.path;
+    log("[STEP] download ok bytes=%s mime=%s", dl.bytes, dl.mime);
+
+    // 2) Upload
+    log("[STEP] files.upload (path)");
+    const fm = fileMgr();
+    const up = await fm.uploadFile(tempFile, {
+      mimeType: dl.mime,
+      displayName: path.basename(tempFile),
+    });
+    uploadedName = up?.file?.name;
+    if (!uploadedName) throw new Error("upload_failed_no_name");
+
+    // wait ACTIVE
+    const active = await waitActive(fm, uploadedName);
+    const fileUri = active.uri;
+    log("[STEP] file ACTIVE name=%s", uploadedName);
+
+    // 3) Generate (Flash by default)
+    const model = genClient().getGenerativeModel({ model: MODEL_ID });
+    const prompt = [
+      "You are scoring short social-video relevance.",
+      "Return only a single integer 0–10 where 0=totally off-niche, 10=perfect match.",
+      "Niche brief:\n" + (niche || "(none)")
+    ].join("\n");
+
+    log("[MODEL] generate start");
+    const resp = await model.generateContent({
+      contents: [{
+        role: "user",
+        parts: [
+          { text: prompt },
+          { fileData: { mimeType: dl.mime, fileUri } }
+        ]
+      }],
+      generationConfig: { temperature: 0.2, topP: 0.9 },
+    });
+
+    const text = resp?.response?.text?.() ?? "";
+    // extract first integer 0..10
+    const m = text.match(/(?:^|\D)(10|[0-9])(?:\D|$)/);
+    const score = m ? parseInt(m[1], 10) : 0;
+    log("[DONE] score=%s", score);
+
+    res.json({ ok: true, score });
+    // 4) Cleanup
+    try { await fm.deleteFile(uploadedName); log("[CLEANUP] delete ok name=%s", uploadedName); } catch {}
+  } catch (e) {
+    // map common errors to your app’s codes
+    const msg = String(e);
+    log("[ERR] %s", msg);
+
+    if (msg.includes("API key not valid") || msg.includes("API_KEY_INVALID")) {
+      return res.status(401).json({ error: "API_KEY_INVALID" });
+    }
+    if (msg.startsWith("proxy_non_")) {
+      const code = msg.split(" ")[0];
+      return res.status(500).json({ error: code });
+    }
+    return res.status(500).json({ error: "GEN_INTERNAL" });
+  } finally {
+    if (tempFile) {
+      try { await fs.unlink(tempFile); log("[CLEANUP] temp deleted %s", tempFile); } catch {}
+    }
+  }
+});
+
+// boot
+APP.listen(PORT, () => {
+  console.log(`[BOOT] node=${process.version}, keyLen=${API_KEY.length}, model=${MODEL_ID}`);
+  console.log(`pinflow-proxy up on :${PORT}`);
+});
