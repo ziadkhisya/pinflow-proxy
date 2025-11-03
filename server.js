@@ -1,191 +1,216 @@
-// server.js — Node 22+, ESM
+// server.js
+// Pinflow proxy: /score endpoint that downloads a video URL, uploads to Gemini Files,
+// waits for ACTIVE, calls generateContent with strict JSON, and returns normalized result.
 
-import http from "node:http";
-import { writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import crypto from "node:crypto";
+import { createServer } from "http";
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
+import { readFile, writeFile, unlink } from "fs/promises";
+import path from "path";
 
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager } from "@google/generative-ai/server";
+// ---- Config (env) ----
+const PORT = process.env.PORT || 10000;
+const API_KEY = process.env.GEMINI_API_KEY || process.env.API_KEY || "";
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-const PORT  = process.env.PORT ? Number(process.env.PORT) : 10000;
-const API_KEY =
-  process.env.API_KEY ||
-  process.env.GEMINI_API_KEY ||
-  process.env.GOOGLE_API_KEY ||
-  "";
+const API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta";
 
-const MODEL = process.env.MODEL || "gemini-2.5-flash";
+// ---- Small helpers ----
+const json = (res, code, obj) => {
+  res.statusCode = code;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(obj));
+};
 
-const genAI = new GoogleGenerativeAI(API_KEY);
-const files = new GoogleAIFileManager(API_KEY);
+const clampInt = (n, min, max) => {
+  n = Number.isFinite(+n) ? Math.round(+n) : min;
+  if (n < min) n = min;
+  if (n > max) n = max;
+  return n;
+};
 
-// ---------- tiny helpers ----------
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const ok  = (res, obj) => send(res, 200, obj);
-const err = (res, code, msg) => send(res, code, { error: msg });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function send(res, code, obj) {
-  const text = JSON.stringify(obj);
-  res.writeHead(code, {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(text),
-    "access-control-allow-origin": "*",
-    "access-control-allow-headers": "content-type",
-    "access-control-allow-methods": "POST,GET,OPTIONS"
-  });
-  res.end(text);
+async function downloadToTemp(url) {
+  console.log("[DL:start]", url);
+  const r = await fetch(url, { redirect: "follow" });
+  if (!r.ok) throw new Error(`DOWNLOAD_FAILED ${r.status}`);
+  const mime = r.headers.get("content-type") || "application/octet-stream";
+  const ab = await r.arrayBuffer();
+  const tmp = path.join(tmpdir(), `pinflow_${Date.now()}_${randomUUID()}.bin`);
+  await writeFile(tmp, Buffer.from(ab));
+  console.log("[DL:ok]", "bytes=", Buffer.byteLength(Buffer.from(ab)), "mime=", mime);
+  return { tmp, mime };
 }
 
-function notFound(res) { err(res, 404, "not_found"); }
+async function uploadFile(filePath, mime) {
+  // REST upload endpoint (multipart/form-data). Uses Node 22's native fetch/FormData/Blob
+  const fd = new FormData();
+  const buf = await readFile(filePath);
+  fd.append("file", new Blob([buf]), "upload.bin");
+  fd.append("fileMimeType", mime);
+  fd.append("displayName", `pin_${Date.now()}`);
 
-function parseJSON(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", c => (body += c));
-    req.on("end", () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
-      catch (e) { reject(e); }
-    });
-    req.on("error", reject);
-  });
+  const url = `${UPLOAD_BASE}/files?key=${API_KEY}`;
+  const r = await fetch(url, { method: "POST", body: fd });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`UPLOAD_FAILED ${r.status} ${t}`);
+  }
+  const j = await r.json(); // { name, uri?, state }
+  console.log("[UP:ok]", j.name, j.state || "UNKNOWN");
+  return j;
 }
 
-async function fetchToFile(url) {
-  const r = await fetch(url, {
-    redirect: "follow",
-    headers: {
-      "user-agent": "Mozilla/5.0 Chrome/120 Safari/537.36"
-    }
-  });
-  if (!r.ok) throw new Error(`download_non_200 ${r.status}`);
-
-  // Web stream in Node 22 — use arrayBuffer, not .pipe()
-  const ab   = await r.arrayBuffer();
-  const buf  = Buffer.from(ab);
-  const file = join(tmpdir(), `pinflow_${Date.now()}_${crypto.randomBytes(3).toString("hex")}.bin`);
-  await writeFile(file, buf);
-  const mime = (r.headers.get("content-type") || "application/octet-stream").split(";")[0];
-  return { path: file, mime, bytes: buf.length };
-}
-
-async function waitActive(name, timeoutMs = 45000) {
+async function waitActive(fileName, timeoutMs = 15000) {
   const start = Date.now();
   while (true) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/${name}?key=${encodeURIComponent(API_KEY)}`;
-    const r = await fetch(url);
-    const j = await r.json().catch(() => ({}));
-    const state = j?.state || j?.file?.state;
-    if (state === "ACTIVE") return;
-    if (Date.now() - start > timeoutMs) throw new Error("file_not_active_timeout");
-    await sleep(1000);
+    const r = await fetch(`${API_BASE}/files/${encodeURIComponent(fileName)}?key=${API_KEY}`);
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`FILES_GET_FAILED ${r.status} ${t}`);
+    }
+    const j = await r.json(); // { state, uri, ... }
+    const st = j.state || "STATE_UNKNOWN";
+    console.log("[UP:wait]", "state=", st, "elapsed=", Date.now() - start, "ms");
+    if (st === "ACTIVE") return j;
+    if (Date.now() - start > timeoutMs) throw new Error("GEN_FILE_NOT_ACTIVE");
+    await sleep(600);
   }
 }
 
-function promptFor(niche) {
-  return `
-You're scoring if a short video is relevant to this niche:
+async function generateScore(fileUri, mime, niche) {
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text:
+              "You are a strict rater. Score how relevant the video is to the niche brief on a 0–10 scale.\n" +
+              'Return ONLY JSON with keys: {"score": int 0-10, "reason": string <=200 chars, "confidence": int 0-100}.\n' +
+              "No prose, no markdown, no extra keys.",
+          },
+          { text: `Niche brief:\n${niche}` },
+          { file_data: { file_uri: fileUri, mime_type: mime } },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+    },
+  };
 
-Niche brief:
-${niche || "(none provided)"}
+  const r = await fetch(`${API_BASE}/models/${MODEL}:generateContent?key=${API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`GEN_CALL_FAILED ${r.status} ${t}`);
+  }
+  const j = await r.json();
+  const text = j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-Return ONLY this JSON (no code fences):
-{"score": <0-10>, "reason": "<1-2 sentences plain text>", "confidence": <0-100>}
-`;
-}
-
-async function handleScore(req, res) {
-  if (!API_KEY) return err(res, 401, "API_KEY_INVALID");
-
-  let body;
-  try { body = await parseJSON(req); }
-  catch { return err(res, 400, "bad_json"); }
-
-  const videoUrl = body.resolved_url || body.resolvedUrl || body.url || body.video_url || body.link;
-  const niche    = body.niche || body.nicheBrief || "";
-
-  if (!videoUrl) return err(res, 400, "MISSING_FIELDS");
-
+  let obj;
   try {
-    console.log("[REQ] /score", videoUrl);
-
-    // 1) download
-    console.log("[STEP] download start");
-    const dl = await fetchToFile(videoUrl);
-    console.log("[STEP] download ok bytes=%d mime=%s", dl.bytes, dl.mime);
-
-    // 2) upload
-    console.log("[STEP] files.upload");
-    const up = await files.uploadFile(dl.path, {
-      mimeType: dl.mime,
-      displayName: "video"
-    });
-    const uploaded = up?.file || up;
-    const fileName = uploaded?.name;
-    const fileUri  = uploaded?.uri;
-    if (!fileName || !fileUri) throw new Error("upload_failed");
-
-    // 3) wait ACTIVE (prevents GEN_INTERNAL)
-    await waitActive(fileName);
-
-    // 4) score
-    const model  = genAI.getGenerativeModel({ model: MODEL });
-    const prompt = promptFor(niche);
-
-    const resp = await model.generateContent({
-      contents: [
-        { role: "user", parts: [{ text: prompt }] },
-        { role: "user", parts: [{ fileData: { fileUri, mimeType: dl.mime } }] }
-      ]
-    });
-
-    const raw = (resp?.response?.text?.() ?? "").trim();
-    const clean = raw.replace(/^```json\s*|\s*```$/g, "");
-    let parsed;
-    try { parsed = JSON.parse(clean); }
-    catch { parsed = { score: 0, reason: clean.slice(0, 500), confidence: 0 }; }
-
-    const out = {
-      score: Number.isFinite(Number(parsed.score)) ? Number(parsed.score) : 0,
-      reason: String(parsed.reason ?? "").slice(0, 500),
-      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0
-    };
-
-    console.log("[OK] scored ->", out);
-    ok(res, { ok: true, model: MODEL, result: out });
-  } catch (e) {
-    const m = String(e?.message || e);
-    console.error("[ERR]", m);
-    err(
-      res,
-      500,
-      m.includes("download_non_200") ? "download_non_200"
-      : m.includes("file_not_active") ? "file_not_active"
-      : m.includes("API key not valid") ? "API_KEY_INVALID"
-      : "GEN_INTERNAL"
-    );
+    obj = JSON.parse(text); // sometimes models still wrap JSON-in-string -> try once
+  } catch {
+    try {
+      obj = JSON.parse((text || "").trim().replace(/```(?:json)?/g, "")); // unwrap code fences if any
+    } catch {
+      obj = {};
+    }
   }
+
+  const score = clampInt(obj.score, 0, 10);
+  const confidence = clampInt(obj.confidence, 0, 100);
+  const reason =
+    typeof obj.reason === "string" && obj.reason.trim()
+      ? obj.reason.trim().slice(0, 200)
+      : score === 0
+      ? "No match with niche brief."
+      : "Relevant.";
+
+  console.log("[GEN:ok]", `score=${score} conf=${confidence}`);
+  return { score, reason, confidence };
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === "OPTIONS") return ok(res, { ok: true });
+// ---- HTTP server ----
+createServer(async (req, res) => {
+  try {
+    // CORS
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") return res.end();
 
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-    res.end("pinflow-proxy");
-    return;
+    if (req.url === "/") return json(res, 200, { ok: true, name: "pinflow-proxy" });
+    if (req.url === "/health")
+      return json(res, 200, { ok: true, hasKey: !!API_KEY, model: MODEL });
+    if (req.url === "/diag")
+      return json(res, 200, { ok: true, keyLen: API_KEY ? API_KEY.length : 0, model: MODEL });
+
+    if (req.url === "/score" && req.method === "GET")
+      return json(res, 405, { ok: false, error: "USE_POST" });
+
+    if (req.url === "/score" && req.method === "POST") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const raw = Buffer.concat(chunks).toString("utf8");
+      let body = {};
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        return json(res, 400, { ok: false, error: "BAD_JSON" });
+      }
+
+      const url = body.resolved_url || body.resolvedUrl || body.url;
+      const niche = body.nicheBrief || body.niche || "";
+      console.log("[REQ]", "/score", "url=", url, "nicheLen=", niche.length);
+
+      if (!API_KEY) return json(res, 401, { ok: false, error: "API_KEY_MISSING" });
+      if (!url || !niche) return json(res, 400, { ok: false, error: "MISSING_FIELDS", fields: Object.keys(body) });
+
+      let tempPath, mime;
+      try {
+        const dl = await downloadToTemp(url);
+        tempPath = dl.tmp;
+        mime = dl.mime;
+
+        const uploaded = await uploadFile(tempPath, mime);
+        const fileMeta = await waitActive(uploaded.name);
+        const fileUri = fileMeta?.uri || `files/${uploaded.name}`;
+
+        const result = await generateScore(fileUri, mime, niche);
+        return json(res, 200, { ok: true, model: MODEL, result });
+      } catch (err) {
+        const msg = String(err?.message || err);
+        console.error("[ERR]", msg);
+
+        let code = "GEN_INTERNAL";
+        if (msg.includes("API key") || msg.includes("API_KEY_INVALID")) code = "API_KEY_INVALID";
+        else if (msg.includes("GEN_FILE_NOT_ACTIVE")) code = "GEN_FILE_NOT_ACTIVE";
+        else if (msg.startsWith("DOWNLOAD_FAILED")) code = "DOWNLOAD_FAILED";
+        else if (msg.startsWith("UPLOAD_FAILED")) code = "UPLOAD_FAILED";
+        else if (msg.startsWith("FILES_GET_FAILED")) code = "FILES_GET_FAILED";
+        else if (msg.startsWith("GEN_CALL_FAILED")) code = "GEN_CALL_FAILED";
+
+        return json(res, 500, { ok: false, error: code, details: msg });
+      } finally {
+        if (tempPath) try { await unlink(tempPath); } catch {}
+      }
+    }
+
+    return json(res, 404, { ok: false, error: "NOT_FOUND" });
+  } catch (e) {
+    console.error("FATAL", e);
+    return json(res, 500, { ok: false, error: "FATAL" });
   }
-  if (req.method === "GET" && req.url === "/selftest") return ok(res, { ok: true, text: "Ping!" });
-  if (req.method === "GET" && req.url === "/health")   return ok(res, { ok: true, hasKey: !!API_KEY, model: MODEL });
-  if (req.method === "GET" && req.url === "/diag")     return ok(res, { ok: true, keyLen: (API_KEY||"").length, model: MODEL });
-
-  if (req.method === "POST" && req.url === "/score")   return handleScore(req, res);
-
-  return notFound(res);
-});
-
-server.listen(PORT, () => {
-  console.log(`[BOOT] node=${process.versions.node} model=${MODEL}`);
-  console.log(`pinflow-proxy up on :${PORT}`);
+}).listen(PORT, () => {
+  console.log("[BOOT]", "node=" + process.version, "model=" + MODEL);
+  console.log("pinflow-proxy up on :" + PORT);
 });
