@@ -2,14 +2,13 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { createWriteStream, promises as fsp } from "node:fs";
 import { basename, join } from "node:path";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager, toFile } from "@google/generative-ai/server";
+import { Blob } from "node:buffer";
 
 const PORT = process.env.PORT || 10000;
-// Accept either name so AI Studio and Render env both work.
 const API_KEY = process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-const MODEL_ID = process.env.MODEL || "gemini-2.5-flash";
+const MODEL_ID = process.env.MODEL || "gemini-2.5-flash"; // same as before
 
+// ---------- tiny helpers ----------
 const send = (res, code, body, headers = {}) => {
   res.writeHead(code, {
     "content-type": "application/json; charset=utf-8",
@@ -20,9 +19,9 @@ const send = (res, code, body, headers = {}) => {
   });
   res.end(JSON.stringify(body));
 };
-const ok = (res, body) => send(res, 200, body);
-const bad = (res, body) => send(res, 400, body);
-const fail = (res, body) => send(res, 500, body);
+const ok = (res, b) => send(res, 200, b);
+const bad = (res, b) => send(res, 400, b);
+const fail = (res, b) => send(res, 500, b);
 
 const readJson = (req) =>
   new Promise((resolve, reject) => {
@@ -37,6 +36,7 @@ const readJson = (req) =>
 const log = (...xs) => console.log(...xs);
 const elog = (...xs) => console.error(...xs);
 
+// ---------- download from GDrive (or any URL) ----------
 async function downloadToTemp(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`download_not_ok:${r.status}`);
@@ -51,10 +51,29 @@ async function downloadToTemp(url) {
   return p;
 }
 
-async function waitActive(fileMgr, fileId, timeoutMs = 30000) {
+// ---------- REST upload to Gemini Files API ----------
+async function uploadFile(path) {
+  const buf = await fsp.readFile(path);
+  const fd = new FormData();
+  fd.append("file", new Blob([buf], { type: "video/mp4" }), "video.mp4");
+
+  const u = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${API_KEY}`;
+  const r = await fetch(u, { method: "POST", body: fd });
+  if (!r.ok) throw new Error(`upload_not_ok:${r.status}`);
+  return await r.json(); // { file: { name, uri, state } }
+}
+
+async function getFile(fileName) {
+  const u = `https://generativelanguage.googleapis.com/v1beta/files/${encodeURIComponent(fileName)}?key=${API_KEY}`;
+  const r = await fetch(u);
+  if (!r.ok) throw new Error(`file_get_not_ok:${r.status}`);
+  return await r.json(); // { name, state, ... }
+}
+
+async function waitActive(fileName, timeoutMs = 30000) {
   const t0 = Date.now();
   while (true) {
-    const f = await fileMgr.getFile(fileId);
+    const f = await getFile(fileName);
     if (f.state === "ACTIVE") return f;
     if (f.state === "FAILED") throw new Error("file_failed");
     if (Date.now() - t0 > timeoutMs) throw new Error("file_not_active_timeout");
@@ -62,23 +81,64 @@ async function waitActive(fileMgr, fileId, timeoutMs = 30000) {
   }
 }
 
-function normalizeModelText(resp) {
-  const txt = resp?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
-  return (txt || "").trim();
-}
-function extractResultObject(text) {
-  let t = text.trim();
-  // strip markdown fences
-  if (t.startsWith("```")) {
-    const i = t.indexOf("\n"); t = t.slice(i + 1);
-    const j = t.lastIndexOf("```"); if (j !== -1) t = t.slice(0, j);
+// ---------- call generateContent ----------
+async function genScore({ fileUri, niche }) {
+  const systemText = `
+You are scoring a short video for niche fit.
+
+Niche brief:
+${niche}
+
+Return STRICT JSON only:
+{"score": <0..10>, "reason": "<1-2 sentences>", "confidence": <0..100>}
+`.trim();
+
+  const payload = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: systemText },
+          { fileData: { fileUri, mimeType: "video/mp4" } }
+        ]
+      }
+    ]
+  };
+
+  const u = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:generateContent?key=${API_KEY}`;
+  const r = await fetch(u, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) throw new Error(`gen_not_ok:${r.status}`);
+  const j = await r.json();
+  const text = (j?.candidates?.[0]?.content?.parts || [])
+    .map((p) => p.text || "")
+    .join("")
+    .trim();
+
+  // try strict JSON; otherwise salvage numbers
+  let out = { score: 0, reason: text, confidence: 0 };
+  try {
+    const parsed = JSON.parse(
+      text.startsWith("```") ? text.replace(/```[\s\S]*?\n?|\n?```/g, "").trim() : text
+    );
+    if (parsed && typeof parsed === "object") out = parsed;
+  } catch {
+    const m = text.match(
+      /"score"\s*:\s*(\d+)[\s\S]*?"reason"\s*:\s*"([\s\S]*?)"[\s\S]*?"confidence"\s*:\s*(\d+)/i
+    );
+    if (m) out = { score: +m[1], reason: m[2], confidence: +m[3] };
   }
-  try { const obj = JSON.parse(t); if (obj && typeof obj === "object") return obj; } catch {}
-  const m = t.match(/"score"\s*:\s*(\d+)[\s\S]*?"reason"\s*:\s*"([\s\S]*?)"[\s\S]*?"confidence"\s*:\s*(\d+)/i);
-  if (m) return { score: +m[1], reason: m[2], confidence: +m[3] };
-  return { score: 0, reason: t, confidence: 0 };
+  return {
+    score: Number(out.score) || 0,
+    reason: String(out.reason || "").slice(0, 500),
+    confidence: Number(out.confidence) || 0
+  };
 }
 
+// ---------- main handler ----------
 async function handleScore(req, res) {
   let body;
   try { body = await readJson(req); } catch { return bad(res, { error: "bad_json" }); }
@@ -100,14 +160,13 @@ async function handleScore(req, res) {
     return fail(res, { error: "network_error" });
   }
 
-  // 2) upload
-  const genAI = new GoogleGenerativeAI(API_KEY);
-  const fileMgr = new GoogleAIFileManager(API_KEY);
-  let uploaded;
+  // 2) upload + wait ACTIVE
+  let file;
   try {
-    uploaded = await fileMgr.uploadFile(toFile(temp, "video/mp4"));
-    await waitActive(fileMgr, uploaded.file.name);
-    log("[STEP] upload ok id=%s", uploaded.file.name);
+    const up = await uploadFile(temp);
+    file = up.file;
+    await waitActive(file.name);
+    log("[STEP] upload ok id=%s", file.name);
   } catch (e) {
     elog("[upload:error]", e?.message || e);
     await fsp.rm(temp).catch(() => {});
@@ -115,50 +174,18 @@ async function handleScore(req, res) {
   }
 
   // 3) score
-  let out = { score: 0, reason: "", confidence: 0 };
   try {
-    const model = genAI.getGenerativeModel({ model: MODEL_ID });
-    const system = `
-You score short videos for niche fit. Output strict JSON:
-{"score": <0..10>, "reason": "<1-2 sentence justification>", "confidence": <0..100>}
-Only score high if the video clearly relates to the niche.
-Niche brief:
-${niche}
-`.trim();
-
-    const resp = await model.generateContent({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: system },
-            { fileData: { fileUri: uploaded.file.uri, mimeType: "video/mp4" } }
-          ]
-        }
-      ]
-    });
-
-    const text = normalizeModelText(resp);
-    out = extractResultObject(text);
-    log("[OK] scored -> %j", out);
+    const result = await genScore({ fileUri: file.uri, niche });
+    await fsp.rm(temp).catch(() => {});
+    return ok(res, { ok: true, model: MODEL_ID, result });
   } catch (e) {
     elog("[gen:error]", e?.message || e);
     await fsp.rm(temp).catch(() => {});
     return fail(res, { error: "GEN_INTERNAL" });
   }
-
-  await fsp.rm(temp).catch(() => {});
-  ok(res, {
-    ok: true,
-    model: MODEL_ID,
-    result: {
-      score: Number(out.score) || 0,
-      reason: String(out.reason || "").slice(0, 500),
-      confidence: Number(out.confidence) || 0
-    }
-  });
 }
 
+// ---------- server ----------
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "OPTIONS") return ok(res, { ok: true });
