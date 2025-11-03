@@ -1,170 +1,215 @@
 import http from "node:http";
 import { tmpdir } from "node:os";
-import { writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { createWriteStream, promises as fsp } from "node:fs";
+import { basename, join } from "node:path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { GoogleAIFileManager } from "@google/generative-ai/server";
+import { GoogleAIFileManager, toFile } from "@google/generative-ai/server";
 
+// ---- config ----
 const PORT = process.env.PORT || 10000;
-const MODEL = process.env.MODEL || "gemini-2.5-flash";
-
-// Accept either env name
 const API_KEY = process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-if (!API_KEY) {
-  console.error("[BOOT] NO API KEY in env (API_KEY or GEMINI_API_KEY)");
-} else {
-  console.log(`[BOOT] node=${process.version} model=${MODEL}`);
-}
+const MODEL_ID = process.env.MODEL || "gemini-2.5-flash";
 
-const genAI = new GoogleGenerativeAI(API_KEY);
-const files = new GoogleAIFileManager(API_KEY);
-
-const ok = (res, code, body) => {
-  res.writeHead(code, { "content-type": "application/json" });
+// ---- helpers ----
+const send = (res, code, body, headers = {}) => {
+  res.writeHead(code, {
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "content-type, authorization",
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    ...headers
+  });
   res.end(JSON.stringify(body));
 };
 
-const bad = (res, code, msg, extra) => {
-  res.writeHead(code, { "content-type": "application/json" });
-  res.end(JSON.stringify({ error: msg, ...(extra || {}) }));
-};
+const ok = (res, body) => send(res, 200, body);
+const bad = (res, body) => send(res, 400, body);
+const fail = (res, body) => send(res, 500, body);
 
-const readJsonBody = async (req) =>
+const readJson = async (req) =>
   new Promise((resolve, reject) => {
-    let s = "";
-    req.on("data", (c) => (s += c));
+    let data = "";
+    req.on("data", (c) => (data += c));
     req.on("end", () => {
-      try { resolve(JSON.parse(s || "{}")); } catch (e) { reject(e); }
-    });
-  });
-
-async function downloadToTmp(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`download_${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const mime = r.headers.get("content-type") || "application/octet-stream";
-  const p = join(tmpdir(), `pinflow_${Date.now()}.mp4`);
-  await writeFile(p, buf);
-  return { path: p, bytes: buf.length, mime };
-}
-
-async function uploadWithWait(path, mime) {
-  const up = await files.uploadFile(path, { mimeType: mime, displayName: "pinflow-video" });
-  const name = up.file?.name || up.name; // SDK shapes vary slightly
-  const deadline = Date.now() + 30000;
-  let state = "PROCESSING", last;
-  while (Date.now() < deadline) {
-    last = await files.getFile(name);
-    state = last.state || last.file?.state || state;
-    if (state === "ACTIVE") break;
-    await new Promise((r) => setTimeout(r, 600));
-  }
-  if (state !== "ACTIVE") throw Object.assign(new Error("upload_timeout"), { state });
-  const fileUri = (last.uri || last.file?.uri);
-  return { name, uri: fileUri, state: "ACTIVE" };
-}
-
-function sanitizeReason(x) {
-  let s = String(x ?? "");
-  // If the model ever returns a JSON blob mistakenly inside reason, strip braces
-  if (s.trim().startsWith("{")) {
-    try {
-      const j = JSON.parse(s);
-      if (typeof j.reason === "string") s = j.reason;
-    } catch { /* ignore */ }
-  }
-  s = s.replace(/\s+/g, " ").trim();
-  if (s.length > 240) s = s.slice(0, 240);
-  return s;
-}
-
-async function handleScore(req, res) {
-  let tmp = null;
-  try {
-    const body = await readJsonBody(req);
-    const url = body.resolved_url || body.resolvedUrl;
-    const niche = body.niche || body.nicheBrief || "";
-    if (!url) return bad(res, 400, "MISSING_FIELDS", { need: ["resolved_url|resolvedUrl","niche|nicheBrief"] });
-
-    console.log("[REQ] /score url=%s", url);
-    const dl = await downloadToTmp(url);
-    console.log("[STEP] download ok bytes=%d mime=%s", dl.bytes, dl.mime);
-    tmp = dl.path;
-
-    const up = await uploadWithWait(dl.path, dl.mime);
-    // STRICT JSON schema + mime
-    const model = genAI.getGenerativeModel({
-      model: MODEL,
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "object",
-          properties: {
-            score: { type: "integer" },
-            reason: { type: "string" },
-            confidence: { type: "integer" }
-          },
-          required: ["score","reason","confidence"]
-        }
+      try {
+        resolve(JSON.parse(data || "{}"));
+      } catch (e) {
+        reject(e);
       }
     });
+    req.on("error", reject);
+  });
 
-    const sys = [
-      "You rate if the video matches the target niche.",
-      "Return STRICT JSON ONLY with {score,reason,confidence}.",
-      "score: 0..10 (10 = perfect on-topic).",
-      "reason: <= 200 chars, one sentence, no JSON.",
-      "confidence: 0..100 (how confident you are)."
-    ].join(" ");
+const log = (...xs) => console.log(...xs);
+const elog = (...xs) => console.error(...xs);
 
-    const user = `Target niche brief:\n${niche}\nScoring task: Does this video belong to the niche?`;
+// Download to temp file
+async function downloadToTemp(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download_not_ok:${r.status}`);
+  const name = basename(new URL(url).pathname || "video.mp4") || "video.mp4";
+  const p = join(tmpdir(), `pinflow_${Date.now()}_${name}`);
+  await new Promise((resolve, reject) => {
+    const out = createWriteStream(p);
+    r.body.pipe(out);
+    r.body.on("error", reject);
+    out.on("finish", resolve);
+  });
+  return p;
+}
 
-    const resp = await model.generateContent({
-      contents: [{
-        role: "user",
-        parts: [
-          {fileData: { fileUri: up.uri, mimeType: dl.mime }},
-          {text: `${sys}\n\n${user}`}
-        ]
-      }]
-    });
-
-    let text = resp.response.text();
-    let parsed;
-    try { parsed = JSON.parse(text); }
-    catch {
-      // emergency rescue: extract first {...}
-      const m = text.match(/\{[\s\S]*\}/);
-      if (m) parsed = JSON.parse(m[0]);
-      else throw new Error("PARSE_FAIL");
-    }
-
-    let score = Math.max(0, Math.min(10, parseInt(parsed.score ?? 0, 10)));
-    let confidence = Math.max(0, Math.min(100, parseInt(parsed.confidence ?? 0, 10)));
-    let reason = sanitizeReason(parsed.reason);
-
-    const result = { score, reason, confidence };
-    console.log("[OK] scored -> %j", result);
-    return ok(res, 200, { ok: true, model: MODEL, result });
-  } catch (e) {
-    const msg = e?.status === 400 && e?.statusText ? "GEN_400" : (e?.message || "GEN_INTERNAL");
-    console.error("[ERR]", e);
-    return ok(res, 500, { error: msg });
-  } finally {
-    if (tmp) { try { await rm(tmp, { force: true }); } catch {} }
+// Wait for Gemini file ACTIVE
+async function waitActive(fileMgr, fileId, timeoutMs = 30000) {
+  const start = Date.now();
+  while (true) {
+    const f = await fileMgr.getFile(fileId);
+    if (f.state === "ACTIVE") return f;
+    if (f.state === "FAILED") throw new Error("file_failed");
+    if (Date.now() - start > timeoutMs) throw new Error("file_not_active_timeout");
+    await new Promise((r) => setTimeout(r, 400));
   }
 }
 
+function normalizeModelText(resp) {
+  const txt =
+    resp?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
+  return (txt || "").trim();
+}
+
+// Try to coerce model text to clean JSON object
+function extractResultObject(text) {
+  let t = text.trim();
+
+  // strip fences if present
+  if (t.startsWith("```")) {
+    const i = t.indexOf("\n");
+    t = t.slice(i + 1);
+    const lastFence = t.lastIndexOf("```");
+    if (lastFence !== -1) t = t.slice(0, lastFence);
+  }
+
+  // sometimes it returns stringified JSON inside a field
+  try {
+    const obj = JSON.parse(t);
+    if (typeof obj === "object" && obj) return obj;
+  } catch (_) {
+    // fall through
+  }
+
+  // heuristics: pull out {"score":...,"reason":...,"confidence":...}
+  const m = t.match(/"score"\s*:\s*(\d+)[\s\S]*?"reason"\s*:\s*"([\s\S]*?)"[\s\S]*?"confidence"\s*:\s*(\d+)/i);
+  if (m) {
+    return { score: Number(m[1]), reason: m[2], confidence: Number(m[3]) };
+  }
+
+  // last resort: return plain text as reason with score 0
+  return { score: 0, reason: t, confidence: 0 };
+}
+
+// ---- core scoring ----
+async function handleScore(req, res) {
+  let body;
+  try {
+    body = await readJson(req);
+  } catch {
+    return bad(res, { error: "bad_json" });
+  }
+
+  const url =
+    body.resolved_url || body.resolvedUrl || body.url || body.link || null;
+  const niche = body.nicheBrief || body.niche || "";
+
+  if (!url) return bad(res, { error: "missing_fields", need: ["resolved_url", "nicheBrief"] });
+  if (!API_KEY) return fail(res, { error: "no_api_key" });
+
+  log("[REQ] /score url=%s", url);
+
+  // 1) download
+  let temp;
+  try {
+    temp = await downloadToTemp(url);
+  } catch (e) {
+    elog("[download:error]", e?.message || e);
+    return fail(res, { error: "network_error" });
+  }
+
+  // 2) upload
+  const genAI = new GoogleGenerativeAI(API_KEY);
+  const fileMgr = new GoogleAIFileManager(API_KEY);
+
+  let uploaded;
+  try {
+    uploaded = await fileMgr.uploadFile(toFile(temp, "video/mp4"));
+    await waitActive(fileMgr, uploaded.file.name); // poll ACTIVE
+  } catch (e) {
+    elog("[upload:error]", e?.message || e);
+    await fsp.rm(temp).catch(() => {});
+    return fail(res, { error: "upload_error" });
+  }
+
+  // 3) score
+  let resultObj = { score: 0, reason: "", confidence: 0 };
+  try {
+    const model = genAI.getGenerativeModel({ model: MODEL_ID });
+
+    const system = `
+You are scoring short videos for niche fit. Output strict JSON:
+{"score": <0..10>, "reason": "<1-2 sentence justification>", "confidence": <0..100>}
+Score high ONLY if the video visibly/clearly relates to the niche.
+Current niche brief:
+${niche}
+    `.trim();
+
+    const resp = await model.generateContent({
+      contents: [
+        { role: "user", parts: [{ text: system }, { fileData: { fileUri: uploaded.file.uri, mimeType: "video/mp4" } }] }
+      ]
+    });
+
+    const text = normalizeModelText(resp);
+    resultObj = extractResultObject(text);
+  } catch (e) {
+    elog("[gen:error]", e?.message || e);
+    await fsp.rm(temp).catch(() => {});
+    return fail(res, { error: "GEN_INTERNAL" });
+  }
+
+  // 4) cleanup + return
+  await fsp.rm(temp).catch(() => {});
+  ok(res, {
+    ok: true,
+    model: MODEL_ID,
+    result: {
+      score: Number(resultObj.score) || 0,
+      reason: String(resultObj.reason || "").slice(0, 500),
+      confidence: Number(resultObj.confidence) || 0
+    }
+  });
+}
+
+// ---- server ----
 const server = http.createServer(async (req, res) => {
-  const u = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === "GET" && u.pathname === "/selftest") return ok(res, 200, { ok:true, text:"Ping!" });
-  if (req.method === "GET" && u.pathname === "/health")  return ok(res, 200, { ok:true, hasKey: !!API_KEY, model: MODEL });
-  if (req.method === "GET" && u.pathname === "/diag")    return ok(res, 200, { ok:true, keyLen: API_KEY.length, model: MODEL });
+  try {
+    if (req.method === "OPTIONS") return ok(res, { ok: true });
+    if (req.url === "/") return ok(res, { ok: true, name: "pinflow-proxy" });
+    if (req.url === "/selftest") return ok(res, { ok: true, text: "Ping!" });
+    if (req.url === "/diag")
+      return ok(res, { ok: true, keyLen: (API_KEY || "").length, model: MODEL_ID });
+    if (req.url === "/health")
+      return ok(res, { ok: true, hasKey: !!API_KEY, model: MODEL_ID });
 
-  if (req.method === "POST" && u.pathname === "/score")  return handleScore(req, res);
+    if (req.url.startsWith("/score") && req.method === "POST") {
+      return handleScore(req, res);
+    }
 
-  res.writeHead(404, { "content-type": "text/plain" });
-  res.end("Cannot " + req.method + " " + u.pathname);
+    send(res, 404, { ok: false, error: "not_found" });
+  } catch (e) {
+    elog("[server:error]", e);
+    fail(res, { error: "server_error" });
+  }
 });
 
-server.listen(PORT, () => console.log(`pinflow-proxy up on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`[BOOT] node=${process.version} model=${MODEL_ID}`);
+  console.log(`pinflow-proxy up on :${PORT}`);
+});
