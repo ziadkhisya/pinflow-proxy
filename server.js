@@ -1,167 +1,170 @@
-// server.js  — ESM, Node 22+
-//
-// Fixes: r.body.pipe is not a function (uses arrayBuffer -> writeFile)
-// Adds: file ACTIVE wait, tight error mapping, CORS, robust JSON shaping
+// server.js — Node 22+, ESM
 
 import http from "node:http";
-import { writeFile, unlink } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import crypto from "node:crypto";
-import { GoogleGenerativeAI, GoogleAIFileManager } from "@google/generative-ai";
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
-const API_KEY = process.env.API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleAIFileManager } from "@google/generative-ai/server";
+
+const PORT  = process.env.PORT ? Number(process.env.PORT) : 10000;
+const API_KEY =
+  process.env.API_KEY ||
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  "";
+
 const MODEL = process.env.MODEL || "gemini-2.5-flash";
 
 const genAI = new GoogleGenerativeAI(API_KEY);
 const files = new GoogleAIFileManager(API_KEY);
 
-const ok = (res, body) => json(res, 200, body);
-const bad = (res, code, msg) => json(res, code, { error: msg });
+// ---------- tiny helpers ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const ok  = (res, obj) => send(res, 200, obj);
+const err = (res, code, msg) => send(res, code, { error: msg });
 
-function json(res, code, obj) {
-  const txt = JSON.stringify(obj);
+function send(res, code, obj) {
+  const text = JSON.stringify(obj);
   res.writeHead(code, {
     "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(txt),
+    "content-length": Buffer.byteLength(text),
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "content-type",
-    "access-control-allow-methods": "POST,GET,OPTIONS",
+    "access-control-allow-methods": "POST,GET,OPTIONS"
   });
-  res.end(txt);
+  res.end(text);
 }
 
-function notFound(res) { bad(res, 404, "not_found"); }
-function parseBody(req) {
+function notFound(res) { err(res, 404, "not_found"); }
+
+function parseJSON(req) {
   return new Promise((resolve, reject) => {
-    let b = "";
-    req.on("data", c => (b += c));
+    let body = "";
+    req.on("data", c => (body += c));
     req.on("end", () => {
-      try { resolve(b ? JSON.parse(b) : {}); } catch (e) { reject(e); }
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { reject(e); }
     });
     req.on("error", reject);
   });
 }
 
-async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 async function fetchToFile(url) {
   const r = await fetch(url, {
     redirect: "follow",
     headers: {
-      // Drive sometimes behaves better with a UA
-      "user-agent":
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-    },
+      "user-agent": "Mozilla/5.0 Chrome/120 Safari/537.36"
+    }
   });
   if (!r.ok) throw new Error(`download_non_200 ${r.status}`);
-  const ab = await r.arrayBuffer();                    // <-- Web stream safe
-  const tmp = join(tmpdir(), `pinflow_${Date.now()}_${crypto.randomBytes(3).toString("hex")}.bin`);
-  await writeFile(tmp, Buffer.from(ab));
+
+  // Web stream in Node 22 — use arrayBuffer, not .pipe()
+  const ab   = await r.arrayBuffer();
+  const buf  = Buffer.from(ab);
+  const file = join(tmpdir(), `pinflow_${Date.now()}_${crypto.randomBytes(3).toString("hex")}.bin`);
+  await writeFile(file, buf);
   const mime = (r.headers.get("content-type") || "application/octet-stream").split(";")[0];
-  return { path: tmp, mime, bytes: Buffer.byteLength(Buffer.from(ab)) };
+  return { path: file, mime, bytes: buf.length };
 }
 
-async function waitFileActive(fileName, timeoutMs = 45000) {
+async function waitActive(name, timeoutMs = 45000) {
   const start = Date.now();
   while (true) {
-    // Use raw REST to avoid SDK gaps
-    const metaUrl = `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${encodeURIComponent(API_KEY)}`;
-    const r = await fetch(metaUrl);
+    const url = `https://generativelanguage.googleapis.com/v1beta/${name}?key=${encodeURIComponent(API_KEY)}`;
+    const r = await fetch(url);
     const j = await r.json().catch(() => ({}));
     const state = j?.state || j?.file?.state;
-    if (state === "ACTIVE") return j;
+    if (state === "ACTIVE") return;
     if (Date.now() - start > timeoutMs) throw new Error("file_not_active_timeout");
     await sleep(1000);
   }
 }
 
-function buildPrompt(nicheBrief) {
+function promptFor(niche) {
   return `
 You're scoring if a short video is relevant to this niche:
 
 Niche brief:
-${nicheBrief || "(none provided)"}
+${niche || "(none provided)"}
 
-Score STRICTLY as JSON only:
+Return ONLY this JSON (no code fences):
 {"score": <0-10>, "reason": "<1-2 sentences plain text>", "confidence": <0-100>}
-
-- score: 0 (not related) … 10 (perfectly on-topic)
-- reason: do NOT return JSON here; plain text sentence only.
-- confidence: subjective certainty in the score (0–100).
-Return ONLY that JSON object.`;
+`;
 }
 
 async function handleScore(req, res) {
-  if (!API_KEY) return bad(res, 401, "API_KEY_INVALID");
+  if (!API_KEY) return err(res, 401, "API_KEY_INVALID");
+
   let body;
-  try { body = await parseBody(req); }
-  catch { return bad(res, 400, "bad_json"); }
+  try { body = await parseJSON(req); }
+  catch { return err(res, 400, "bad_json"); }
 
-  // accept both old and new keys
-  const videoUrl = body.resolved_url || body.resolvedUrl || body.url || body.URL || body.link || body.video_url;
-  const niche = body.niche || body.nicheBrief || "";
+  const videoUrl = body.resolved_url || body.resolvedUrl || body.url || body.video_url || body.link;
+  const niche    = body.niche || body.nicheBrief || "";
 
-  if (!videoUrl) return bad(res, 400, "MISSING_FIELDS");
+  if (!videoUrl) return err(res, 400, "MISSING_FIELDS");
 
   try {
-    console.log("[REQ] /score", "url=" + videoUrl);
-    // 1) Download to temp file
-    console.log("[STEP] download start", videoUrl);
+    console.log("[REQ] /score", videoUrl);
+
+    // 1) download
+    console.log("[STEP] download start");
     const dl = await fetchToFile(videoUrl);
     console.log("[STEP] download ok bytes=%d mime=%s", dl.bytes, dl.mime);
 
-    // 2) Upload file
-    console.log("[STEP] files.upload (path)");
+    // 2) upload
+    console.log("[STEP] files.upload");
     const up = await files.uploadFile(dl.path, {
       mimeType: dl.mime,
-      displayName: "video",
+      displayName: "video"
     });
-    const uploaded = up?.file || up; // SDK returns {file:{...}}
+    const uploaded = up?.file || up;
     const fileName = uploaded?.name;
     const fileUri  = uploaded?.uri;
     if (!fileName || !fileUri) throw new Error("upload_failed");
 
-    // 3) Wait ACTIVE to avoid GEN_INTERNAL
-    await waitFileActive(fileName);
+    // 3) wait ACTIVE (prevents GEN_INTERNAL)
+    await waitActive(fileName);
 
-    // 4) Ask model
-    const model = genAI.getGenerativeModel({ model: MODEL });
-    const prompt = buildPrompt(niche);
+    // 4) score
+    const model  = genAI.getGenerativeModel({ model: MODEL });
+    const prompt = promptFor(niche);
+
     const resp = await model.generateContent({
       contents: [
         { role: "user", parts: [{ text: prompt }] },
-        { role: "user", parts: [{ fileData: { fileUri, mimeType: dl.mime } }] },
-      ],
+        { role: "user", parts: [{ fileData: { fileUri, mimeType: dl.mime } }] }
+      ]
     });
 
-    const text = (resp?.response?.text?.() ?? "").trim();
-    const clean = text.replace(/^```json\s*|\s*```$/g, ""); // strip fences if any
-
+    const raw = (resp?.response?.text?.() ?? "").trim();
+    const clean = raw.replace(/^```json\s*|\s*```$/g, "");
     let parsed;
     try { parsed = JSON.parse(clean); }
-    catch {
-      // fallback: treat full text as reason if non-JSON
-      parsed = { score: 0, reason: clean.slice(0, 500), confidence: 0 };
-    }
+    catch { parsed = { score: 0, reason: clean.slice(0, 500), confidence: 0 }; }
 
-    // normalize types
     const out = {
       score: Number.isFinite(Number(parsed.score)) ? Number(parsed.score) : 0,
       reason: String(parsed.reason ?? "").slice(0, 500),
-      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0,
+      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0
     };
 
     console.log("[OK] scored ->", out);
     ok(res, { ok: true, model: MODEL, result: out });
-  } catch (err) {
-    const msg = String(err?.message || err);
-    console.error("[ERR]", msg);
-    bad(res, 500, msg.includes("download_non_200") ? "download_non_200"
-         : msg.includes("file_not_active")        ? "file_not_active"
-         : msg.includes("API key not valid")      ? "API_KEY_INVALID"
-         : "GEN_INTERNAL");
+  } catch (e) {
+    const m = String(e?.message || e);
+    console.error("[ERR]", m);
+    err(
+      res,
+      500,
+      m.includes("download_non_200") ? "download_non_200"
+      : m.includes("file_not_active") ? "file_not_active"
+      : m.includes("API key not valid") ? "API_KEY_INVALID"
+      : "GEN_INTERNAL"
+    );
   }
 }
 
