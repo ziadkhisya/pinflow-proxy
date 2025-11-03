@@ -1,14 +1,10 @@
 // server.js
-// Pinflow proxy: /score endpoint that downloads a video URL, uploads to Gemini Files,
-// waits for ACTIVE, calls generateContent with strict JSON, and returns normalized result.
-
 import { createServer } from "http";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
 import { readFile, writeFile, unlink } from "fs/promises";
 import path from "path";
 
-// ---- Config (env) ----
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GEMINI_API_KEY || process.env.API_KEY || "";
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -16,20 +12,17 @@ const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta";
 
-// ---- Small helpers ----
 const json = (res, code, obj) => {
   res.statusCode = code;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(obj));
 };
-
 const clampInt = (n, min, max) => {
   n = Number.isFinite(+n) ? Math.round(+n) : min;
   if (n < min) n = min;
   if (n > max) n = max;
   return n;
 };
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function downloadToTemp(url) {
@@ -44,21 +37,23 @@ async function downloadToTemp(url) {
   return { tmp, mime };
 }
 
+// *** FIXED: use exactly TWO parts: file + mime_type. No display_name here. ***
 async function uploadFile(filePath, mime) {
-  // REST upload endpoint (multipart/form-data). Uses Node 22's native fetch/FormData/Blob
   const fd = new FormData();
   const buf = await readFile(filePath);
   fd.append("file", new Blob([buf]), "upload.bin");
-  fd.append("fileMimeType", mime);
-  fd.append("displayName", `pin_${Date.now()}`);
+  fd.append("mime_type", mime); // required, snake_case
 
-  const url = `${UPLOAD_BASE}/files?key=${API_KEY}`;
-  const r = await fetch(url, { method: "POST", body: fd });
+  const r = await fetch(`${UPLOAD_BASE}/files`, {
+    method: "POST",
+    headers: { "X-Goog-Api-Key": API_KEY }, // put key in header
+    body: fd,
+  });
   if (!r.ok) {
     const t = await r.text();
     throw new Error(`UPLOAD_FAILED ${r.status} ${t}`);
   }
-  const j = await r.json(); // { name, uri?, state }
+  const j = await r.json(); // { name: "files/abc...", state: "PENDING"... }
   console.log("[UP:ok]", j.name, j.state || "UNKNOWN");
   return j;
 }
@@ -71,7 +66,7 @@ async function waitActive(fileName, timeoutMs = 15000) {
       const t = await r.text();
       throw new Error(`FILES_GET_FAILED ${r.status} ${t}`);
     }
-    const j = await r.json(); // { state, uri, ... }
+    const j = await r.json();
     const st = j.state || "STATE_UNKNOWN";
     console.log("[UP:wait]", "state=", st, "elapsed=", Date.now() - start, "ms");
     if (st === "ACTIVE") return j;
@@ -117,10 +112,10 @@ async function generateScore(fileUri, mime, niche) {
 
   let obj;
   try {
-    obj = JSON.parse(text); // sometimes models still wrap JSON-in-string -> try once
+    obj = JSON.parse(text);
   } catch {
     try {
-      obj = JSON.parse((text || "").trim().replace(/```(?:json)?/g, "")); // unwrap code fences if any
+      obj = JSON.parse((text || "").trim().replace(/```(?:json)?/g, ""));
     } catch {
       obj = {};
     }
@@ -139,10 +134,8 @@ async function generateScore(fileUri, mime, niche) {
   return { score, reason, confidence };
 }
 
-// ---- HTTP server ----
 createServer(async (req, res) => {
   try {
-    // CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -170,7 +163,7 @@ createServer(async (req, res) => {
 
       const url = body.resolved_url || body.resolvedUrl || body.url;
       const niche = body.nicheBrief || body.niche || "";
-      console.log("[REQ]", "/score", "url=", url, "nicheLen=", niche.length);
+      console.log("[REQ] /score", "url=", url, "nicheLen=", niche.length);
 
       if (!API_KEY) return json(res, 401, { ok: false, error: "API_KEY_MISSING" });
       if (!url || !niche) return json(res, 400, { ok: false, error: "MISSING_FIELDS", fields: Object.keys(body) });
@@ -183,7 +176,8 @@ createServer(async (req, res) => {
 
         const uploaded = await uploadFile(tempPath, mime);
         const fileMeta = await waitActive(uploaded.name);
-        const fileUri = fileMeta?.uri || `files/${uploaded.name}`;
+        // safer fallback: uploaded.name is already "files/<id>"
+        const fileUri = fileMeta?.uri || uploaded.name;
 
         const result = await generateScore(fileUri, mime, niche);
         return json(res, 200, { ok: true, model: MODEL, result });
